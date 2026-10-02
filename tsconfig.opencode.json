@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023", "dom"],
+    "types": ["node"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["opencode/*.ts", "src/**/*.ts"]
+}

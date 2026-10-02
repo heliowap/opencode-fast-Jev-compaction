@@ -1,5 +1,10 @@
 # fast-jev-compaction
 
+> **Fork note.** This fork of
+> [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) adds an
+> [OpenCode V2 plugin](opencode/README.md) that runs the same library from OpenCode's `compaction`
+> hook. `src/` and the Claude Code plugin are unchanged from upstream.
+
 Claude Code plugin that replaces the compaction summary with Jev decisions:
 every tool call and result is scored in one fast request, stale ones are
 dropped or truncated, everything kept stays verbatim. Also usable as an npm
