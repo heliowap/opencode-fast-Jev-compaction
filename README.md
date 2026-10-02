@@ -3,7 +3,9 @@
 > **Fork note.** This fork of
 > [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) adds an
 > [OpenCode V2 plugin](opencode/README.md) that runs the same library from OpenCode's `compaction`
-> hook. `src/` and the Claude Code plugin are unchanged from upstream.
+> hook. Install it with `opencode plugin add github:heliowap/opencode-fast-Jev-compaction`; without a
+> TypeSafe key it uses OpenCode Zen's free Jev. Library change: an empty `apiKey` sends no
+> `authorization` header.
 
 Claude Code plugin that replaces the compaction summary with Jev decisions:
 every tool call and result is scored in one fast request, stale ones are
@@ -173,7 +175,7 @@ just the repo's `.claude-plugin/marketplace.json`.
 npm install
 npm run typecheck        # library + hook
 npm test
-npm run build
+npm run compile
 npm run validate:plugin  # claude plugin validate
 TYPESAFE_API_KEY="$(cat ~/.typesafe_key)" npm run demo
 ```

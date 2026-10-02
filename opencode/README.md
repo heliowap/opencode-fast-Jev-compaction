@@ -32,7 +32,7 @@ There is no auto-compaction trigger; OpenCode's own `compaction.auto` decides wh
 
 The hook leaves the result unset, so OpenCode writes its built-in summary, when:
 
-- `TYPESAFE_API_KEY` (or the `apiKey` option) is missing;
+- the `typesafe` provider is forced without a key;
 - Jev fails, answers malformed, or takes more than 60 s;
 - the reduction is below `minReductionRatio`;
 - the checkpoint is longer than `maxSummaryChars`. The previous checkpoint returns as the pinned
@@ -45,34 +45,46 @@ compaction message.
 
 ## Install
 
-The plugin has no runtime dependencies. Copy `opencode/` and `src/` side by side into OpenCode's
-global plugin directory, keeping the relative import:
-
 ```sh
-git clone https://github.com/heliowap/opencode-fast-Jev-compaction.git
-mkdir -p ~/.config/opencode/plugins/fast-jev-compaction
-cp -R opencode-fast-Jev-compaction/{opencode,src,LICENSE} ~/.config/opencode/plugins/fast-jev-compaction/
-printf "export { default } from './opencode/index.js';\n" \
-  > ~/.config/opencode/plugins/fast-jev-compaction/index.ts
+opencode plugin add github:heliowap/opencode-fast-Jev-compaction
 ```
 
-OpenCode discovers the directory and loads its `index.ts` with default options. In OpenCode
-2.0.22, a `main` field in `package.json` was not enough for discovery; the root `index.ts` is. The OpenCode service
-must have `TYPESAFE_API_KEY` in its environment; a service started without it always falls back.
+This installs the package from git and adds it to `plugins` in the global `opencode.jsonc`. No npm
+publish or build step is involved: OpenCode loads `opencode/index.ts` through the package's
+`./server` export, and the plugin has no runtime dependencies. Pin a commit with
+`github:heliowap/opencode-fast-Jev-compaction#<sha>`; `opencode plugin update` refreshes an unpinned
+install.
 
-To disable the plugin, delete the directory or add `"-fast-jev-compaction"` to `plugins`.
+To remove it, run `opencode plugin remove github:heliowap/opencode-fast-Jev-compaction`.
+
+## Where Jev runs
+
+| Environment | Endpoint | Model |
+| --- | --- | --- |
+| `TYPESAFE_API_KEY` set | TypeSafe (`api.typesafe.ai`) | `jev-latest` |
+| no TypeSafe key | OpenCode Zen (`opencode.ai/zen`) | `jev-1.13-free`, no key needed |
+| no TypeSafe key, `OPENCODE_API_KEY` set | OpenCode Zen, with that key | `jev-1.13-free` |
+
+Set `provider` (`"typesafe"` or `"opencode"`) to force either. Installs that take no options can use
+the `FAST_JEV_PROVIDER` environment variable instead. The plugin logs its choice at startup, for
+example `[fast-jev-compaction] Jev: jev-1.13-free via OpenCode Zen (no key)`.
+
+These keys must be in the OpenCode service's environment, not only in the shell that runs the client.
+
+OpenCode describes `jev-1.13-free` as available "for a limited time". Zen's privacy section says Jev
+prompts are not used for training and are retained under TypeSafe's privacy policy. Zen's paid
+`jev-1.13` needs a funded Zen balance; select it with `"model": "jev-1.13"`.
 
 ## Options
 
-To pass options, copy the files to a directory outside `plugins/` and load it with the object form
-in `opencode.json(c)`, using an absolute path:
+Pass options with the object form in `opencode.json(c)`:
 
 ```jsonc
 {
   "plugins": [
     {
-      "package": "/absolute/path/to/fast-jev-compaction",
-      "options": { "keepThreshold": 0.5, "minReductionRatio": 0.25 }
+      "package": "github:heliowap/opencode-fast-Jev-compaction",
+      "options": { "provider": "opencode", "keepThreshold": 0.5 }
     }
   ]
 }
@@ -80,9 +92,10 @@ in `opencode.json(c)`, using an absolute path:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `apiKey` | `TYPESAFE_API_KEY` | TypeSafe API key |
-| `model` | `jev-latest` | Jev model name |
-| `baseUrl` | System One endpoint | Jev endpoint |
+| `provider` | `typesafe` with a TypeSafe key, else `opencode` | Where Jev runs |
+| `apiKey` | `TYPESAFE_API_KEY`, or `OPENCODE_API_KEY` on Zen | API key for the provider |
+| `model` | `jev-latest`, or `jev-1.13-free` on Zen | Jev model name |
+| `baseUrl` | the provider's System One endpoint | Jev endpoint |
 | `keepThreshold` | `0.5` | Minimum keep probability for a call or result |
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
@@ -98,5 +111,9 @@ npm install
 npm run typecheck:opencode
 npx vitest run tests/opencode.test.ts
 ```
+
+The package has no `build` or `prepare` script on purpose. When it installs a git dependency, npm
+runs a full `npm install` in the clone if one of those scripts is present, and OpenCode's installer
+fails with "git dep preparation failed". The TypeScript compile is `npm run compile`.
 
 Tested against OpenCode 2.0.22 and `@opencode/plugin` 2.0.22.

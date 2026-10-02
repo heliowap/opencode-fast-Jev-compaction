@@ -11,15 +11,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./server": "./opencode/index.ts"
   },
   "files": [
     "dist",
+    "opencode",
+    "src",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
+    "compile": "tsc",
     "typecheck": "tsc --noEmit && npm run typecheck:hooks && npm run typecheck:opencode",
     "test": "vitest run",
     "demo": "tsx examples/demo.ts",

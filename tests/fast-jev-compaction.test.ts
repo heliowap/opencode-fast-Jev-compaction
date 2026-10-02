@@ -390,6 +390,11 @@ describe('compact', () => {
 });
 
 describe('HTTP client', () => {
+  it('sends no authorization header without a key', () => {
+    const request = buildJevRequest({ apiKey: '' }, 's', {});
+    expect(request.headers).toEqual({ 'content-type': 'application/json' });
+  });
+
   it('builds a System One request', () => {
     const request = buildJevRequest({ apiKey: 'k' }, { a: 1 }, {
       q: { type: 'noul', instructions: 'x' },

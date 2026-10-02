@@ -2,7 +2,13 @@ import type { Plugin } from '@opencode/plugin';
 
 import { fromOpenCode, renderTranscript, type OcMessage } from './adapter.js';
 import { compact, reductionRatio } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import {
+  buildJevRequest,
+  DEFAULT_MODEL,
+  OPENCODE_ZEN_FREE_MODEL,
+  OPENCODE_ZEN_URL,
+  parseJevResponse,
+} from '../src/request.js';
 import type { CompactOptions, CompactResult, JevAsker } from '../src/types.js';
 
 const NUMERIC_OPTIONS = [
@@ -13,7 +19,10 @@ const NUMERIC_OPTIONS = [
   'truncateHeadChars',
 ] as const;
 
+export type Provider = 'typesafe' | 'opencode';
+
 export interface PluginConfig extends CompactOptions {
+  provider: Provider;
   apiKey?: string;
   model: string;
   baseUrl?: string;
@@ -29,20 +38,36 @@ function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/**
+ * Where Jev is reached: TypeSafe when a TypeSafe key is configured, otherwise
+ * OpenCode Zen's free Jev, which needs no key (`OPENCODE_API_KEY` is sent when
+ * set). The `provider` option, or `FAST_JEV_PROVIDER` for installs that take
+ * no options, forces either.
+ */
 export function resolveConfig(options: Record<string, unknown>, env = process.env): PluginConfig {
+  const typesafeKey = str(options.apiKey) ?? str(env.TYPESAFE_API_KEY);
+  const forced = str(options.provider) ?? str(env.FAST_JEV_PROVIDER);
+  const provider: Provider =
+    forced === 'typesafe' || forced === 'opencode' ? forced : typesafeKey ? 'typesafe' : 'opencode';
+  const zen = provider === 'opencode';
   const config: PluginConfig = {
-    model: str(options.model) ?? DEFAULT_MODEL,
+    provider,
+    model: str(options.model) ?? (zen ? OPENCODE_ZEN_FREE_MODEL : DEFAULT_MODEL),
     minReductionRatio: num(options.minReductionRatio, 0.25),
     maxSummaryChars: num(options.maxSummaryChars, 100_000),
   };
   for (const key of NUMERIC_OPTIONS) {
     if (typeof options[key] === 'number') config[key] = num(options[key], 0);
   }
-  const apiKey = str(options.apiKey) ?? str(env.TYPESAFE_API_KEY);
+  const apiKey = zen ? (str(options.apiKey) ?? str(env.OPENCODE_API_KEY)) : typesafeKey;
   if (apiKey) config.apiKey = apiKey;
-  const baseUrl = str(options.baseUrl);
+  const baseUrl = str(options.baseUrl) ?? (zen ? OPENCODE_ZEN_URL : undefined);
   if (baseUrl) config.baseUrl = baseUrl;
   return config;
+}
+
+export function describeProvider(config: PluginConfig): string {
+  return `${config.model} via ${config.provider === 'opencode' ? 'OpenCode Zen' : 'TypeSafe'} (${config.apiKey ? 'key' : 'no key'})`;
 }
 
 export function jevAsker(config: PluginConfig, fetchFn: typeof fetch = fetch): JevAsker {
@@ -74,7 +99,9 @@ export async function pruneForCheckpoint(
   config: PluginConfig,
   asker: JevAsker,
 ): Promise<Outcome> {
-  if (!config.apiKey) return { kind: 'fallback', reason: 'TYPESAFE_API_KEY is not configured' };
+  if (config.provider === 'typesafe' && !config.apiKey) {
+    return { kind: 'fallback', reason: 'TYPESAFE_API_KEY is not configured' };
+  }
   const transcript = fromOpenCode(messages);
   const result = await compact(transcript, asker, config);
   const ratio = reductionRatio(result);
@@ -111,6 +138,7 @@ export default {
   async setup(ctx: Ctx) {
     const config = resolveConfig(ctx.options as Record<string, unknown>);
     const asker = jevAsker(config);
+    console.log(`[fast-jev-compaction] Jev: ${describeProvider(config)}`);
     await ctx.session.hook('compaction', async (event) => {
       let outcome: Outcome;
       try {

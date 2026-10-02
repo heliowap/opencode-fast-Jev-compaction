@@ -1,7 +1,7 @@
 import { expect, test } from 'vitest';
 
 import { fromOpenCode, renderTranscript, type OcMessage } from '../opencode/adapter.js';
-import { pruneForCheckpoint, resolveConfig } from '../opencode/index.js';
+import { jevAsker, pruneForCheckpoint, resolveConfig } from '../opencode/index.js';
 import type { JevAsker } from '../src/types.js';
 
 const big = 'x'.repeat(5000);
@@ -72,9 +72,55 @@ test('falls back when the checkpoint exceeds maxSummaryChars', async () => {
   if (outcome.kind === 'fallback') expect(outcome.reason).toMatch(/^checkpoint /);
 });
 
-test('falls back without a key', async () => {
-  const outcome = await pruneForCheckpoint(session(), resolveConfig({}, {}), keepAll);
+test('uses TypeSafe when a TypeSafe key is set', () => {
+  const config = resolveConfig({}, { TYPESAFE_API_KEY: 't', OPENCODE_API_KEY: 'o' });
+  expect(config).toMatchObject({ provider: 'typesafe', apiKey: 't', model: 'jev-latest' });
+  expect(config.baseUrl).toBeUndefined();
+});
+
+test('uses the free Jev on OpenCode Zen without any key', () => {
+  const config = resolveConfig({}, {});
+  expect(config).toMatchObject({
+    provider: 'opencode',
+    model: 'jev-1.13-free',
+    baseUrl: 'https://opencode.ai/zen/v1/systemone',
+  });
+  expect(config.apiKey).toBeUndefined();
+});
+
+test('sends OPENCODE_API_KEY to Zen when set', () => {
+  expect(resolveConfig({}, { OPENCODE_API_KEY: 'o' })).toMatchObject({ provider: 'opencode', apiKey: 'o' });
+});
+
+test('provider option and FAST_JEV_PROVIDER force the provider', () => {
+  expect(resolveConfig({ provider: 'opencode' }, { TYPESAFE_API_KEY: 't' })).toMatchObject({
+    provider: 'opencode',
+    model: 'jev-1.13-free',
+  });
+  expect(resolveConfig({}, { TYPESAFE_API_KEY: 't', FAST_JEV_PROVIDER: 'opencode' }).provider).toBe('opencode');
+  expect(resolveConfig({ provider: 'typesafe' }, { FAST_JEV_PROVIDER: 'opencode' }).provider).toBe('typesafe');
+});
+
+test('prunes through Zen without a key', async () => {
+  const config = resolveConfig({ preserveRecentMessages: 4 }, {});
+  expect((await pruneForCheckpoint(session(), config, dropAll)).kind).toBe('pruned');
+});
+
+test('falls back when TypeSafe is forced without a key', async () => {
+  const outcome = await pruneForCheckpoint(session(), resolveConfig({ provider: 'typesafe' }, {}), keepAll);
   expect(outcome).toEqual({ kind: 'fallback', reason: 'TYPESAFE_API_KEY is not configured' });
+});
+
+test('the asker omits authorization without a key and sends the Zen model', async () => {
+  const seen: { url: string; init: RequestInit }[] = [];
+  const fake = (async (url: string, init: RequestInit) => {
+    seen.push({ url, init });
+    return new Response('{"answers":{}}', { status: 200 });
+  }) as unknown as typeof fetch;
+  await jevAsker(resolveConfig({}, {}), fake).ask('s', {});
+  expect(seen[0]!.url).toBe('https://opencode.ai/zen/v1/systemone');
+  expect(seen[0]!.init.headers).toEqual({ 'content-type': 'application/json' });
+  expect(JSON.parse(String(seen[0]!.init.body)).model).toBe('jev-1.13-free');
 });
 
 test('renders error results', () => {
