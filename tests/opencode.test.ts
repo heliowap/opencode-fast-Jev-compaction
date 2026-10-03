@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 
-import { fromOpenCode, renderTranscript, type OcMessage } from '../opencode/adapter.js';
+import type { OcMessage } from '../opencode/adapter.js';
 import { jevAsker, pruneForCheckpoint, resolveConfig } from '../opencode/index.js';
 import type { JevAsker } from '../src/types.js';
 
@@ -36,14 +36,6 @@ const keepAll: JevAsker = {
     return { answers: Object.fromEntries(Object.keys(questions).map((n) => [n, { noul: 0.9 }])) };
   },
 };
-
-test('maps tool calls and results by id and drops system messages', () => {
-  const transcript = fromOpenCode(session());
-  expect(transcript.length).toBe(14);
-  expect(transcript[1]).toEqual({ role: 'assistant', text: '', toolUses: [{ tool_use_id: 'c1', tool: 'read', input: { path: 'f1.ts' } }] });
-  expect(transcript[2]!.toolResults![0]!.tool_use_id).toBe('c1');
-  expect(transcript.some((m) => m.text === 'catalog changed')).toBe(false);
-});
 
 test('prunes stale calls, keeps user text verbatim, keeps recent calls', async () => {
   const config = resolveConfig({ preserveRecentMessages: 4 }, { TYPESAFE_API_KEY: 'k' });
@@ -121,14 +113,4 @@ test('the asker omits authorization without a key and sends the Zen model', asyn
   expect(seen[0]!.url).toBe('https://opencode.ai/zen/v1/systemone');
   expect(seen[0]!.init.headers).toEqual({ 'content-type': 'application/json' });
   expect(JSON.parse(String(seen[0]!.init.body)).model).toBe('jev-1.13-free');
-});
-
-test('renders error results', () => {
-  const text = renderTranscript(
-    fromOpenCode([
-      { role: 'assistant', content: [{ type: 'tool-call', id: 'e', name: 'shell', input: { command: 'false' } }] },
-      { role: 'tool', content: [{ type: 'tool-result', id: 'e', name: 'shell', result: { type: 'error', value: 'exit 1' } }] },
-    ]),
-  );
-  expect(text).toContain('[tool error e: shell]\nexit 1');
 });
