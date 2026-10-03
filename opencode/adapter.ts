@@ -1,82 +1,115 @@
-import type { Message, ToolResult, ToolUse } from '../src/types.js';
+import type { ContentPart, Message as AiMessage, ToolResultValue } from '@opencode/ai';
 
-/** The subset of `@opencode/ai` messages the compaction hook hands over. */
-export type OcPart =
-  | { type: 'text'; text: string }
-  | { type: 'reasoning'; text: string }
-  | { type: 'tool-call'; id: string; name: string; input: unknown }
-  | { type: 'tool-result'; id: string; name: string; result: { type: string; value: unknown } }
-  | { type: 'compaction'; text?: string | null }
-  | { type: string; [key: string]: unknown };
+import type { Message, ToolResult } from '../src/types.js';
 
-export interface OcMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
-  content: readonly OcPart[];
+export type OcPart = ContentPart;
+export type OcMessage = Pick<AiMessage, 'role' | 'content'>;
+
+function fileText(file: Extract<Extract<ToolResultValue, { type: 'content' }>['value'][number], { type: 'file' }>): string {
+  return `[file ${JSON.stringify({ mediaType: file.mime, filename: file.name, uri: file.uri })}]`;
 }
 
-function resultText(result: { type: string; value: unknown }): string {
-  if (result.type === 'content' && Array.isArray(result.value)) {
+function mediaText(part: Extract<OcPart, { type: 'media' }>): string {
+  const source = part.media.source;
+  return `[media ${JSON.stringify({
+    mediaType: part.media.mediaType,
+    filename: part.filename,
+    source: source.type,
+    uri: source.type === 'url' ? source.url : undefined,
+    provider: source.type === 'ref' ? source.provider : undefined,
+    id: source.type === 'ref' ? source.id : undefined,
+    info: part.media.info,
+  })}]`;
+}
+
+function resultText(result: ToolResultValue): string {
+  if (result.type === 'content') {
     return result.value
-      .map((item: { type?: string; text?: string; uri?: string; mime?: string }) =>
-        item.type === 'text' ? (item.text ?? '') : `[file ${item.uri ?? ''} ${item.mime ?? ''}]`,
-      )
-      .join('\n');
+      .map((item) => item.type === 'text' ? item.text : fileText(item))
+      .join('\n\n');
   }
   if (typeof result.value === 'string') return result.value;
   return JSON.stringify(result.value) ?? '';
 }
 
-function toInput(input: unknown): Record<string, unknown> {
-  return input !== null && typeof input === 'object' && !Array.isArray(input)
-    ? (input as Record<string, unknown>)
-    : { value: input };
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return input !== null && typeof input === 'object' && !Array.isArray(input);
 }
 
-function partText(part: OcPart): string | undefined {
-  switch (part.type) {
-    case 'text':
-      return (part as { text: string }).text;
-    case 'compaction':
-      return (part as { text?: string | null }).text ?? undefined;
-    case 'media':
-    case 'file':
-      return '[attachment]';
-    default:
-      return undefined;
+/** A reason to leave compaction to OpenCode rather than lose opaque context. */
+export function unsupportedReason(messages: readonly OcMessage[]): string | undefined {
+  for (const message of messages) {
+    for (const part of message.content) {
+      switch (part.type) {
+        case 'compaction':
+          if (part.encrypted !== undefined) return 'encrypted compaction checkpoint';
+          if (typeof part.text !== 'string') return 'compaction checkpoint has no text';
+          break;
+        case 'reasoning':
+          if (part.encrypted !== undefined) return 'encrypted reasoning';
+          break;
+        case 'text':
+        case 'media':
+        case 'tool-call':
+        case 'tool-result':
+        case 'effort':
+          break;
+        default:
+          part satisfies never;
+          return 'unsupported content part';
+      }
+    }
   }
+  return undefined;
 }
 
 /**
  * Maps OpenCode's model messages onto the library's transcript. `system`
- * messages (catalog updates, reminders) are left out: OpenCode re-sends its
- * system prompt after compaction, so they never belong in the checkpoint.
- * Reasoning is left out too; it is provider-encrypted or not replayable.
+ * messages are injected updates; OpenCode re-sends its system prompt after
+ * compaction. Plain reasoning is not replayed by providers. Effort changes are
+ * generation settings, not conversation text.
+ * Each visible part gets its own message to retain order. Pinning consequently
+ * counts these segments, not the original OpenCode messages.
  */
 export function fromOpenCode(messages: readonly OcMessage[]): Message[] {
+  const reason = unsupportedReason(messages);
+  if (reason) throw new Error(reason);
   const out: Message[] = [];
   for (const message of messages) {
     if (message.role === 'system') continue;
-    const texts: string[] = [];
-    const toolUses: ToolUse[] = [];
-    const toolResults: ToolResult[] = [];
+    const role = message.role === 'assistant' ? 'assistant' : 'user';
     for (const part of message.content) {
-      if (part.type === 'tool-call') {
-        const call = part as Extract<OcPart, { type: 'tool-call' }>;
-        toolUses.push({ tool_use_id: call.id, tool: call.name, input: toInput(call.input) });
-      } else if (part.type === 'tool-result') {
-        const result = part as Extract<OcPart, { type: 'tool-result' }>;
-        const entry: ToolResult = { tool_use_id: result.id, text: resultText(result.result) };
-        if (result.result.type === 'error') entry.isError = true;
-        toolResults.push(entry);
-      } else {
-        const text = partText(part);
-        if (text) texts.push(text);
+      switch (part.type) {
+        case 'text':
+          out.push({ role, text: part.text, toolUses: [] });
+          break;
+        case 'compaction':
+          if (typeof part.text === 'string') out.push({ role, text: part.text, toolUses: [] });
+          break;
+        case 'media':
+          out.push({ role, text: mediaText(part), toolUses: [] });
+          break;
+        case 'tool-call':
+          out.push({ role, text: '', toolUses: [{
+            tool_use_id: part.id,
+            tool: part.name,
+            input: isRecord(part.input) ? part.input : { value: part.input },
+          }] });
+          break;
+        case 'tool-result': {
+          const result: ToolResult = { tool_use_id: part.id, text: resultText(part.result) };
+          if (part.result.type === 'error') result.isError = true;
+          out.push({ role, text: '', toolUses: [], toolResults: [result] });
+          break;
+        }
+        case 'reasoning':
+        case 'effort':
+          break;
+        default:
+          part satisfies never;
+          throw new Error('unsupported content part');
       }
     }
-    const role = message.role === 'assistant' ? 'assistant' : 'user';
-    const converted: Message = { role, text: texts.join('\n'), toolUses };
-    if (toolResults.length > 0) converted.toolResults = toolResults;
-    if (converted.text || toolUses.length > 0 || toolResults.length > 0) out.push(converted);
   }
   return out;
 }

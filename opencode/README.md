@@ -23,8 +23,13 @@ Fix the failing test. Never edit src/generated.
 The bug is in a.ts.
 ```
 
-OpenCode keeps its usual recent window (`compaction.keep.tokens`) beside the checkpoint, as with
-the built-in summary. `system` messages and reasoning are left out of the checkpoint.
+Each text, media, tool-call and tool-result part becomes its own block, in the original order, so
+text written around a tool call stays around it. Attachments are described by media type, filename
+and source. `system` messages (OpenCode-injected updates; the system prompt is re-sent after
+compaction), plain reasoning (providers do not replay it) and effort settings are left out.
+
+`preserveRecentMessages` counts these blocks, not OpenCode messages. OpenCode also keeps its own
+recent window (`compaction.keep.tokens`) beside the checkpoint, as with the built-in summary.
 
 There is no auto-compaction trigger; OpenCode's own `compaction.auto` decides when to compact.
 
@@ -33,6 +38,9 @@ There is no auto-compaction trigger; OpenCode's own `compaction.auto` decides wh
 The hook leaves the result unset, so OpenCode writes its built-in summary, when:
 
 - the `typesafe` provider is forced without a key;
+- the history holds content that cannot be rendered as text without loss: an encrypted compaction
+  checkpoint (OpenAI Responses native compaction), a checkpoint without text, or encrypted
+  reasoning;
 - Jev fails, answers malformed, or takes more than 60 s;
 - the reduction is below `minReductionRatio`;
 - the checkpoint is longer than `maxSummaryChars`. The previous checkpoint returns as the pinned
@@ -40,7 +48,8 @@ The hook leaves the result unset, so OpenCode writes its built-in summary, when:
   summary reset them.
 
 The reason is logged as a warning. The outcome of the last compaction per session is kept in the
-plugin storage under `last/<sessionID>`, and successful runs add `metadata.fastJevCompaction` to the
+plugin storage under `last/<sessionID>` on a best-effort basis. Storage failures are logged and do
+not prevent either compaction or fallback. Successful runs add `metadata.fastJevCompaction` to the
 compaction message.
 
 ## Install
@@ -103,6 +112,8 @@ Pass options with the object form in `opencode.json(c)`:
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
 | `minReductionRatio` | `0.25` | Below this reduction, fall back to the built-in summary |
 | `maxSummaryChars` | `100000` | Above this checkpoint size, fall back to the built-in summary |
+
+Missing, non-number, and non-finite numeric options use the defaults above.
 
 ## Development
 
