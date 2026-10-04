@@ -7,6 +7,10 @@
 > TypeSafe key it uses OpenCode Zen's free Jev. Library change: an empty `apiKey` sends no
 > `authorization` header.
 
+> **Unofficial project.** `opencode-fast-Jev-compaction` is not built by the OpenCode team
+> and is not affiliated with OpenCode or Anomaly in any way. This notice follows OpenCode's
+> [Building on OpenCode guidance](https://github.com/anomalyco/opencode#building-on-opencode).
+
 Claude Code plugin that replaces the compaction summary with Jev decisions:
 every tool call and result is scored in one fast request, stale ones are
 dropped or truncated, everything kept stays verbatim. Also usable as an npm
@@ -196,3 +200,9 @@ demo/JevDemo/build.sh   # builds demo/JevDemo/build/JevDemo.app and launches it
 ```
 
 Press space in the app to replay from the start.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE), as is the original
+[fast-jev-compaction project](https://github.com/tamaratran/fast-jev-compaction).
+The original copyright notice is preserved. Fork modifications are also licensed under MIT.
