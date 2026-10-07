@@ -1,9 +1,9 @@
 # OpenCode V2 plugin
 
-Runs the library in `../src` from OpenCode's `compaction` session hook. When OpenCode compacts a
-session, the plugin asks Jev which old tool calls and results can go, and stores the pruned
-conversation as the checkpoint in place of the model-written summary. User and assistant text stays
-verbatim and in order.
+Uses OpenCode's `compaction` session hook to select a bounded, recoverable checkpoint instead of
+asking a generative model to summarize. Jev scores old tool calls, outputs and assistant prose.
+Original blocks are archived locally **before** anything leaves the active context. Kept blocks
+stay verbatim and in order. No embeddings, database server or extra summary model is required.
 
 ## How it differs from the Claude Code hook
 
@@ -17,7 +17,7 @@ Fix the failing test. Never edit src/generated.
 [tool call call_1: read] {"path":"src/a.ts"}
 
 [tool result call_1: read]
-…verbatim, or the first truncateHeadChars characters and a truncation note…
+…verbatim, or a bounded prefix and a stable archive ID…
 
 [assistant]
 The bug is in a.ts.
@@ -27,11 +27,83 @@ Each text, media, tool-call and tool-result part becomes its own block, in the o
 text written around a tool call stays around it. Attachments are described by media type, filename
 and source. `system` messages (OpenCode-injected updates; the system prompt is re-sent after
 compaction), plain reasoning (providers do not replay it) and effort settings are left out.
+Media remain descriptors in the text checkpoint; encoded sources are archived, but reads do not
+reattach images and expiring remote URLs are not downloaded/materialized. Host cache hints are not
+historical content and are excluded from archived identities.
+
+All user text, the first block, media/checkpoint blocks, unpaired tools and the newest protected
+blocks remain active. Old assistant prose and complete call/result pairs are candidates. Jev sees
+bounded head/tail previews of the actual evidence, not just output lengths. Every candidate remains
+visible in its request; evidence and questions are batched together under both Jev ceilings, with
+at most four requests in flight. Previews are not full-output comprehension guarantees.
+
+Low-scoring blocks are archived first. If more space is needed, eligible blocks are removed in
+ascending relevance order. Protected blocks are never removed to make the budget fit. Content is
+not discarded merely because it might be in a model's training data. This hook does not unload
+host-owned tool schemas, mandatory instructions or skills.
 
 `preserveRecentMessages` counts these blocks, not OpenCode messages. OpenCode also keeps its own
 recent window (`compaction.keep.tokens`) beside the checkpoint, as with the built-in summary.
 
 There is no auto-compaction trigger; OpenCode's own `compaction.auto` decides when to compact.
+
+## Memory and repeated compactations
+
+By default, originals and immutable manifests are JSON files under `.jev-memory/` in the session's
+directory. References use session-scoped stable IDs, not mutable Markdown line numbers. Source
+message/part identities prevent duplicate writes when available; messages without source IDs get
+occurrence-specific IDs. The full catalog stays on disk, not in the checkpoint.
+
+A new checkpoint contains one versioned manifest reference, selected blocks and only useful output
+pointers. On the next round, the plugin resolves its **metadata-tagged** manifest and rebuilds from
+originals; it does not nest or reparse the previous dump. Assessments are reused only while the
+user-task fingerprint and Jev model/provider are unchanged. Archived blocks are recovered on demand,
+not rescored by scanning the entire archive each round.
+
+Tools available to the agent:
+
+- `fast_jev_memory_search(query, limit)`: lexical search in this session, at most 10 snippets.
+- `fast_jev_memory_read(id, offset, limit)`: original text/structured evidence, at most 8000 characters;
+  follow `nextOffset` to continue. Offsets and limits are **characters**, not tokens or lines.
+- `fast_jev_status()`: last outcome, timings, estimated size, budget assumptions and fallback reason.
+
+Search is local and lexical, not semantic or indexed SQL search. Its initial implementation scans
+archive records; very large sessions may need a separate search index later. It is not on the
+mandatory compaction path. Recovery tools do not accept arbitrary paths or another session ID.
+Forked sessions do not automatically inherit access to the parent's archive; an inherited pointer
+that cannot be resolved falls back safely. Native/legacy textual checkpoints are kept as opaque
+protected text: their discarded originals cannot be reconstructed retroactively.
+The host's separately retained `<recent-context>` also arrives as serialized text, not structured
+parts. It is preserved as an opaque protected block rather than unsafely parsing user/tool labels.
+That protected floor can still grow and require native fallback; this is not yet a complete
+hierarchical memory replacement for every part of an OpenCode session.
+
+The plugin remembers the archive root using OpenCode's existing plugin storage, so moving a session
+does not silently redirect its pointers. Do not delete archives referenced by resumable sessions.
+There is no automatic expiration or pruning. Back them up together with the session data.
+
+**Privacy:** originals can contain credentials and other sensitive data. They are local plaintext,
+not encrypted or automatically redacted. Directories/files use private permissions and reject
+symlinks, but `.gitignore` and permissions do not protect against backups or other processes running
+as your user. To avoid new archive writes, use `memory: false` (legacy tool-only mode).
+The archive creates an internal `.gitignore` so it is ignored even in projects without a root-level
+rule. Use a dedicated `memoryDirectory`, never an existing project/home directory.
+
+## Checkpoint budget
+
+Acceptance depends on final rendered size, including instructions and pointers, not percentage
+reduction. The plugin caps `maxSummaryTokens` using the selected model's input/context limit when
+available, subtracting estimated system/tool overhead and configured recent/working reserves.
+It also honors `maxSummaryChars`. `minReductionRatio` is retained for configuration compatibility
+but no longer rejects fitting checkpoints.
+
+Checkpoint tokens are conservatively estimated as the larger of the library estimate and
+`ceil(characters / 3)`. This is **not** the provider's tokenizer. The hook does not expose the actual
+separately retained tail or resolved OpenCode compaction buffer; the default 20k-token tail reserve
+is an explicit assumption, not a fit guarantee. Increase it when using a larger native keep window.
+For small input windows, configure smaller reserves only if the actual tail/workload permits it.
+If model lookup is unavailable, the configured checkpoint target still applies and diagnostics say
+so. `event.options.maxTokens` is an output setting and is not used as an input budget.
 
 ## Fallback
 
@@ -42,15 +114,19 @@ The hook leaves the result unset, so OpenCode writes its built-in summary, when:
   checkpoint (OpenAI Responses native compaction), a checkpoint without text, or encrypted
   reasoning;
 - Jev fails, answers malformed, or takes more than 60 s;
-- the reduction is below `minReductionRatio`;
-- the checkpoint is longer than `maxSummaryChars`. The previous checkpoint returns as the pinned
-  first message and text is never pruned, so checkpoints only grow; the cap lets the built-in
-  summary reset them.
+- archive/root-registration persistence fails, or a referenced manifest is missing, corrupt,
+  unsupported or belongs to another session;
+- the protected context alone exceeds the estimated budget (detected before inference);
+- the final checkpoint cannot fit `maxSummaryTokens` or `maxSummaryChars`.
 
 The reason is logged as a warning. The outcome of the last compaction per session is kept in the
-plugin storage under `last/<sessionID>` on a best-effort basis. Storage failures are logged and do
-not prevent either compaction or fallback. Successful runs add `metadata.fastJevCompaction` to the
-compaction message.
+plugin storage under `last/<sessionID>` on a best-effort basis. **Diagnostic** write failures do not
+prevent compaction; original/manifest/root-registration failures do. Successful runs add
+`metadata.fastJevCompaction`, including the manifest and timings, to the compaction message.
+
+The full checkpoint is still displayed by OpenCode's built-in compaction renderer. The supported
+2.0.22 CLI plugin interface cannot replace just that body. This fork does not claim to hide the dump
+or replace the internal memory with a short UI label.
 
 ## Install
 
@@ -110,8 +186,14 @@ Pass options with the object form in `opencode.json(c)`:
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
-| `minReductionRatio` | `0.25` | Below this reduction, fall back to the built-in summary |
-| `maxSummaryChars` | `100000` | Above this checkpoint size, fall back to the built-in summary |
+| `goal` | protected user history | Additional current-task description; user revisions still count |
+| `memory` | `true` | Recoverable selection; `false` uses legacy tool-only pruning |
+| `memoryDirectory` | `.jev-memory` | Local archive path, initially resolved against the session directory |
+| `maxSummaryTokens` | `20000` | Estimated final checkpoint target, further capped by model limits |
+| `recentReserveTokens` | `20000` | Assumed allowance for the host's separately retained tail |
+| `workingReserveTokens` | `10000` | Space reserved for continuation and framing |
+| `minReductionRatio` | `0.25` | Deprecated compatibility option; reduction is diagnostic only |
+| `maxSummaryChars` | `100000` | Additional final checkpoint character cap |
 
 Missing, non-number, and non-finite numeric options use the defaults above.
 
@@ -121,6 +203,7 @@ Missing, non-number, and non-finite numeric options use the defaults above.
 npm install
 npm run typecheck:opencode
 npx vitest run tests/opencode.test.ts
+npm run benchmark:opencode
 ```
 
 The package has no `build` or `prepare` script on purpose. When it installs a git dependency, npm
@@ -128,3 +211,8 @@ runs a full `npm install` in the clone if one of those scripts is present, and O
 fails with "git dep preparation failed". The TypeScript compile is `npm run compile`.
 
 Tested against OpenCode 2.0.22 and `@opencode/plugin` 2.0.22.
+
+The benchmark uses synthetic history and **simulated** Jev answers, without network/inference
+latency. It compares legacy pruning, cold/warm archives and checkpoint resume. It measures local
+overhead, not real model latency or task quality. Validate live continuation, exact fact recovery,
+fallback rate, provider tokens and total task time separately before claiming a speed/quality gain.

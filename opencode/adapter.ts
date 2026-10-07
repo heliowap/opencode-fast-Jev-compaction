@@ -3,7 +3,7 @@ import type { ContentPart, Message as AiMessage, ToolResultValue } from '@openco
 import type { Message, ToolResult } from '../src/types.js';
 
 export type OcPart = ContentPart;
-export type OcMessage = Pick<AiMessage, 'role' | 'content'>;
+export type OcMessage = Pick<AiMessage, 'role' | 'content'> & Partial<Pick<AiMessage, 'id' | 'metadata'>>;
 
 function fileText(file: Extract<Extract<ToolResultValue, { type: 'content' }>['value'][number], { type: 'file' }>): string {
   return `[file ${JSON.stringify({ mediaType: file.mime, filename: file.name, uri: file.uri })}]`;

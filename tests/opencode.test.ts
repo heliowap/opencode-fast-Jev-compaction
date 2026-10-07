@@ -1,6 +1,9 @@
 import type { SessionCompaction } from '@opencode/plugin/promise/session';
 import { ProviderID } from '@opencode/ai/schema/ids';
 import { afterEach, expect, test, vi } from 'vitest';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { Info } from '@opencode/plugin/promise/tool';
 
 import type { OcMessage } from '../opencode/adapter.js';
 import plugin, { jevAsker, pruneForCheckpoint, resolveConfig } from '../opencode/index.js';
@@ -8,10 +11,12 @@ import { resolveOptions } from '../src/compact.js';
 import type { JevAsker } from '../src/types.js';
 
 const big = 'x'.repeat(5000);
+const roots: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 function session(): OcMessage[] {
@@ -59,10 +64,10 @@ test('prunes stale calls, keeps user text verbatim, keeps recent calls', async (
   expect(summary).toContain('[assistant]\ndone reading');
 });
 
-test('falls back when the reduction is too small', async () => {
+test('accepts a fitting checkpoint even when the reduction is zero', async () => {
   const config = resolveConfig({}, { TYPESAFE_API_KEY: 'k' });
   const outcome = await pruneForCheckpoint(session(), config, keepAll);
-  expect(outcome.kind).toBe('fallback');
+  expect(outcome.kind).toBe('pruned');
 });
 
 test('falls back when the checkpoint exceeds maxSummaryChars', async () => {
@@ -70,6 +75,13 @@ test('falls back when the checkpoint exceeds maxSummaryChars', async () => {
   const outcome = await pruneForCheckpoint(session(), config, dropAll);
   expect(outcome.kind).toBe('fallback');
   if (outcome.kind === 'fallback') expect(outcome.reason).toMatch(/^checkpoint /);
+});
+
+test('measures the rendered checkpoint against its token budget', async () => {
+  const config = resolveConfig({ maxSummaryTokens: 1000 }, {});
+  const outcome = await pruneForCheckpoint(session(), config, keepAll);
+  expect(outcome.kind).toBe('fallback');
+  if (outcome.kind === 'fallback') expect(outcome.reason).toMatch(/estimated tokens above 1000/);
 });
 
 test('uses TypeSafe when a TypeSafe key is set', () => {
@@ -96,6 +108,12 @@ test.each([NaN, Infinity, -Infinity, '12', null, undefined])(
       baseUrl: 'https://opencode.ai/zen/v1/systemone',
       minReductionRatio: 0.25,
       maxSummaryChars: 100000,
+      maxSummaryTokens: 20000,
+      memory: true,
+      memoryDirectory: '.jev-memory',
+      recentReserveTokens: 20000,
+      workingReserveTokens: 10000,
+      goal: undefined,
     });
     expect(resolveOptions(config)).toEqual({
       goal: '',
@@ -214,8 +232,15 @@ test.each([
 });
 
 async function setupHook(options: Record<string, unknown>) {
+  const root = await mkdtemp('/private/tmp/opencode/jev-plugin-');
+  roots.push(root);
+  const tools: Info[] = [];
   let hook: ((event: SessionCompaction) => Promise<void> | void) | undefined;
-  const set = vi.fn(async () => { throw new Error('storage unavailable'); });
+  const values = new Map<string, unknown>();
+  const set = vi.fn(async (key: string, value: unknown) => {
+    if (key.startsWith('last/')) throw new Error('storage unavailable');
+    values.set(key, value);
+  });
   const register: Parameters<typeof plugin.setup>[0]['session']['hook'] = async (name, callback) => {
     expect(name).toBe('compaction');
     // This fixture registers only compaction; the SDK's generic callback cannot narrow by name.
@@ -223,15 +248,21 @@ async function setupHook(options: Record<string, unknown>) {
     return { dispose: async () => {} };
   };
   const ctx = {
-    options,
-    session: { hook: register },
-    storage: { set },
+    options: { memory: false, ...options },
+    session: { hook: register, get: vi.fn(async () => ({ location: { directory: root } } as Awaited<ReturnType<Parameters<typeof plugin.setup>[0]['session']['get']>>)) },
+    storage: { set, get: vi.fn(async (key: string) => values.get(key)) },
+    model: { list: vi.fn(async () => ({ data: [], location: { directory: root } })) },
+    tool: { transform: async (edit) => {
+      edit({ add: (tool) => { tools.push(tool); }, list: () => [], get: () => undefined,
+        namespace: () => {}, remove: () => {}, update: () => {} });
+      return { dispose: async () => {} };
+    } },
   } satisfies Parameters<typeof plugin.setup>[0];
   await plugin.setup(ctx);
   if (!hook) throw new Error('compaction hook was not registered');
   // The hook reads only sessionID and messages and writes result.
-  const event = { sessionID: 'session-test', messages: session() } as SessionCompaction;
-  return { hook, event, set };
+  const event = { sessionID: 'session-test', messages: session(), model: { providerID: 'example', id: 'model' }, system: [], tools: {} } as unknown as SessionCompaction;
+  return { hook, event, set, tools, ctx, root };
 }
 
 test('a rejecting diagnostic store does not prevent a successful checkpoint', async () => {
@@ -258,13 +289,13 @@ test('a rejecting diagnostic store does not prevent the built-in fallback', asyn
     const { state, questions } = JSON.parse(String(init?.body));
     return new Response(JSON.stringify(await keepAll.ask(state, questions)));
   }));
-  const { hook, event, set } = await setupHook({ provider: 'opencode' });
+  const { hook, event, set } = await setupHook({ provider: 'opencode', maxSummaryChars: 1000 });
   await expect(hook(event)).resolves.toBeUndefined();
   expect(event).not.toHaveProperty('result');
   expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
-    kind: 'fallback', reason: 'reduction 0% below 25%',
+    kind: 'fallback', reason: expect.stringMatching(/^checkpoint /),
   }));
-  expect(warn).toHaveBeenCalledWith('[fast-jev-compaction] fallback to built-in summary: reduction 0% below 25%');
+  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[fast-jev-compaction\] fallback to built-in summary: checkpoint /));
 });
 
 test('a transport failure leaves the hook result unset', async () => {
@@ -278,4 +309,61 @@ test('a transport failure leaves the hook result unset', async () => {
     kind: 'fallback', reason: 'network unavailable', stats: {},
   }));
   expect(warn).toHaveBeenCalledWith('[fast-jev-compaction] fallback to built-in summary: network unavailable');
+});
+
+test('the plugin persists originals and exposes session-scoped recovery even when diagnostics fail', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (_input, init) => {
+    const { state, questions } = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify(await dropAll.ask(state, questions)));
+  }));
+  const { hook, event, tools } = await setupHook({ memory: true, preserveRecentMessages: 4 });
+  await hook(event);
+  expect(event.result?.metadata?.fastJevCompaction).toMatchObject({ version: 1, manifestID: expect.any(String) });
+  expect(event.result?.summary).not.toContain('[tool call c2: read]');
+  const search = tools.find((tool) => tool.name === 'fast_jev_memory_search')!;
+  const read = tools.find((tool) => tool.name === 'fast_jev_memory_read')!;
+  const call = { sessionID: event.sessionID } as Parameters<Info['execute']>[1];
+  const found = await search.execute({ query: 'c2', limit: 10 }, call);
+  const hits = JSON.parse(String(found.content));
+  expect(hits.length).toBeGreaterThan(0);
+  const recovered = await read.execute({ id: hits[0].id, limit: 8000 }, call);
+  expect(String(recovered.content)).toContain('c2');
+});
+
+test('an archive failure leaves the native compaction path available without inference', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const fetcher = vi.fn<typeof fetch>();
+  vi.stubGlobal('fetch', fetcher);
+  const { hook, event, root, set } = await setupHook({ memory: true });
+  await writeFile(join(root, '.jev-memory'), 'not a directory');
+  await expect(hook(event)).resolves.toBeUndefined();
+  expect(event.result).toBeUndefined();
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({ kind: 'fallback' }));
+});
+
+test('caps the checkpoint budget using the selected model and explicit reserves', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (_input, init) => {
+    const { state, questions } = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify(await keepAll.ask(state, questions)));
+  }));
+  const { hook, event, ctx, set } = await setupHook({
+    memory: false, recentReserveTokens: 1000, workingReserveTokens: 1000,
+  });
+  ctx.model.list.mockResolvedValue({ data: [{
+    providerID: 'example', id: 'model', limit: { context: 8000, input: 4000, output: 500 },
+  }] as Awaited<ReturnType<typeof ctx.model.list>>['data'], location: { directory: '/unused' } });
+  await hook(event);
+  expect(event.result).toBeUndefined();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'fallback', budgetTokens: expect.any(Number),
+    budgetSource: 'model limit minus estimated system/tools and configured reserves',
+  }));
+  const record = set.mock.calls.find(([key]) => key === 'last/session-test')![1] as { budgetTokens: number };
+  expect(record.budgetTokens).toBeLessThan(2000);
 });

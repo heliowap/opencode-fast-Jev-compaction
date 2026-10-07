@@ -2,8 +2,9 @@
 
 > **Fork note.** This fork of
 > [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) adds an
-> [OpenCode V2 plugin](opencode/README.md) that runs the same library from OpenCode's `compaction`
-> hook. Install it with `opencode plugin add github:heliowap/opencode-fast-Jev-compaction`; without a
+> [OpenCode V2 plugin](opencode/README.md) with budget-aware selection, local recoverable memory and
+> search/read tools through OpenCode's `compaction` hook. The library/Claude Code behavior is unchanged.
+> Install it with `opencode plugin add github:heliowap/opencode-fast-Jev-compaction`; without a
 > TypeSafe key it uses OpenCode Zen's free Jev. Library change: an empty `apiKey` sends no
 > `authorization` header.
 
