@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
 
 import { MemoryArchive } from '../opencode/archive.js';
+import { capacityBudget, fixedBudget } from '../opencode/budget.js';
 import { pruneForCheckpoint, resolveConfig } from '../opencode/index.js';
 import type { JevAsker } from '../src/types.js';
 import { estimateTokens } from '../src/state.js';
@@ -160,6 +161,187 @@ test('falls back without inference when protected user context alone exceeds the
   }, { archive, sessionID: 'floor' });
   expect(outcome.kind).toBe('fallback');
   expect(asked).toBe(false);
+});
+
+test('expands only to a large protected user floor and keeps stale prose exactly recoverable', async () => {
+  const archive = await memory();
+  const text = 'Important user constraint. '.repeat(5600);
+  const prose = 'Obsolete assistant exploration. '.repeat(1000);
+  let requests = 0;
+  const outcome = await pruneForCheckpoint([
+    { id: 'large-user', role: 'user', content: [{ type: 'text', text }] },
+    { id: 'old-assistant', role: 'assistant', content: [{ type: 'text', text: prose }] },
+  ], resolveConfig({ preserveRecentMessages: 0 }, {}), {
+    async ask(state, questions) { requests++; return stale.ask(state, questions); },
+  }, { archive, sessionID: 'adaptive-floor' }, {
+    targetTokens: 20_000, targetChars: 100_000, limitTokens: 272_000, limitChars: 816_000,
+  });
+  expect(outcome.kind).toBe('pruned');
+  expect(requests).toBe(1);
+  if (outcome.kind !== 'pruned') return;
+  expect(outcome.summary).toContain(text);
+  expect(outcome.summary).not.toContain(prose);
+  expect(outcome.details).toMatchObject({
+    targetTokens: 20_000, targetChars: 100_000, limitTokens: 272_000, limitChars: 816_000,
+    protectedChars: outcome.summary.length, effectiveChars: outcome.summary.length,
+    protectedTokens: outcome.estimatedTokens, effectiveTokens: outcome.estimatedTokens,
+    textsArchived: 1,
+  });
+  const hits = await archive.search('adaptive-floor', 'Obsolete assistant exploration');
+  expect(hits).toHaveLength(1);
+  let recovered = '';
+  let offset: number | null = 0;
+  while (offset !== null) {
+    const chunk = await archive.read('adaptive-floor', hits[0]!.id, offset, 8000);
+    recovered += chunk.text;
+    offset = chunk.nextOffset;
+  }
+  expect(recovered).toContain(prose);
+});
+
+test.each([
+  { capacityTokens: 272_000, explicitTokens: 20_000, limitTokens: 20_000, limitChars: 816_000 },
+  { capacityTokens: 272_000, explicitChars: 100_000, limitTokens: 272_000, limitChars: 100_000 },
+  { capacityTokens: 30_000, limitTokens: 30_000, limitChars: 90_000 },
+  { capacityTokens: 30_000, explicitTokens: 100_000, limitTokens: 30_000, limitChars: 90_000 },
+  { capacityTokens: 0, limitTokens: 0, limitChars: 0 },
+  { capacityTokens: -100, limitTokens: 0, limitChars: 0 },
+])('refuses protected-floor overflow before inference with hard capacity/caps %j', async ({
+  capacityTokens, explicitTokens, explicitChars, limitTokens, limitChars,
+}) => {
+  const archive = await memory();
+  let requests = 0;
+  const outcome = await pruneForCheckpoint([
+    { id: 'user', role: 'user', content: [{ type: 'text', text: 'Important user constraint. '.repeat(5600) }] },
+    { id: 'old', role: 'assistant', content: [{ type: 'text', text: 'Old removable prose.' }] },
+  ], resolveConfig({ preserveRecentMessages: 0 }, {}), {
+    async ask(state, questions) { requests++; return stale.ask(state, questions); },
+  }, { archive, sessionID: 'hard-floor' }, capacityBudget({
+    capacityTokens, defaultTokens: 20_000, defaultChars: 100_000, explicitTokens, explicitChars,
+  }));
+  expect(outcome.kind).toBe('fallback');
+  expect(requests).toBe(0);
+  if (outcome.kind !== 'fallback') return;
+  expect(outcome.reason).toMatch(/^protected checkpoint \d+ (chars|estimated tokens) above \d+$/);
+  expect(outcome.details).toMatchObject({
+    protectedTokens: expect.any(Number), protectedChars: expect.any(Number),
+    targetTokens: Math.min(20_000, limitTokens), targetChars: Math.min(100_000, limitChars),
+    limitTokens, limitChars, effectiveTokens: expect.any(Number), effectiveChars: expect.any(Number),
+  });
+  expect(outcome.details!.effectiveTokens).toBeLessThanOrEqual(limitTokens);
+  expect(outcome.details!.effectiveChars).toBeLessThanOrEqual(limitChars);
+});
+
+test('keeps default fixed limits hard when no capacity budget is supplied', async () => {
+  const archive = await memory();
+  let requests = 0;
+  const outcome = await pruneForCheckpoint([
+    { id: 'user', role: 'user', content: [{ type: 'text', text: 'Important user constraint. '.repeat(5600) }] },
+    { id: 'old', role: 'assistant', content: [{ type: 'text', text: 'Old removable prose.' }] },
+  ], resolveConfig({ preserveRecentMessages: 0 }, {}), {
+    async ask(state, questions) { requests++; return stale.ask(state, questions); },
+  }, { archive, sessionID: 'unknown-capacity' });
+  expect(outcome.kind).toBe('fallback');
+  expect(requests).toBe(0);
+  expect(outcome.details).toMatchObject({
+    targetTokens: 20_000, targetChars: 100_000, limitTokens: 20_000, limitChars: 100_000,
+    effectiveTokens: 20_000, effectiveChars: 100_000,
+  });
+});
+
+test('accepts the exact protected checkpoint limits but refuses one additional character', async () => {
+  const archive = await memory();
+  const config = resolveConfig({ preserveRecentMessages: 0 }, {});
+  const text = 'Boundary constraint. '.repeat(100);
+  const messages: OcMessage[] = [{ id: 'user', role: 'user', content: [{ type: 'text', text }] }];
+  const initial = await pruneForCheckpoint(messages, config, stale, { archive, sessionID: 'boundary' });
+  if (initial.kind !== 'pruned') throw new Error('Initial checkpoint failed');
+  const budget = fixedBudget(initial.estimatedTokens!, initial.summary.length);
+  const exact = await pruneForCheckpoint(messages, config, stale, { archive, sessionID: 'boundary' }, budget);
+  expect(exact.kind).toBe('pruned');
+  if (exact.kind !== 'pruned') return;
+  expect(exact.summary).toBe(initial.summary);
+  const over = await pruneForCheckpoint([
+    { id: 'user-plus-one', role: 'user', content: [{ type: 'text', text: `${text}x` }] },
+    { id: 'old', role: 'assistant', content: [{ type: 'text', text: 'Removable prose.' }] },
+  ], config, { async ask() { throw new Error('Overflow must precede inference'); } }, {
+    archive, sessionID: 'boundary',
+  }, budget);
+  expect(over.kind).toBe('fallback');
+  if (over.kind === 'fallback') expect(over.reason).toBe(
+    `protected checkpoint ${initial.summary.length + 1} chars above ${initial.summary.length}`,
+  );
+  const tokenOverflow = await pruneForCheckpoint(messages, config, stale, { archive, sessionID: 'boundary' },
+    fixedBudget(initial.estimatedTokens! - 1, initial.summary.length));
+  expect(tokenOverflow.kind).toBe('fallback');
+  if (tokenOverflow.kind === 'fallback') expect(tokenOverflow.reason).toContain('estimated tokens above');
+});
+
+test('does not expand selection targets for a small protected floor at known capacity', async () => {
+  const archive = await memory();
+  const outcome = await pruneForCheckpoint([
+    { id: 'goal', role: 'user', content: [{ type: 'text', text: 'Implement auth.' }] },
+    { id: 'low', role: 'assistant', content: [{ type: 'text', text: 'LOW relevance '.repeat(120) }] },
+    { id: 'high', role: 'assistant', content: [{ type: 'text', text: 'HIGH relevance '.repeat(120) }] },
+  ], resolveConfig({ preserveRecentMessages: 0, maxSummaryTokens: 900 }, {}), {
+    async ask(_state, questions) {
+      return { answers: Object.fromEntries(Object.keys(questions).map((key) => [key, {
+        noul: key === 'text_m1' ? 0.6 : 0.95,
+      }])) };
+    },
+  }, { archive, sessionID: 'adaptive-ranked' }, capacityBudget({
+    capacityTokens: 272_000, defaultTokens: 900, defaultChars: 100_000,
+  }));
+  expect(outcome.kind).toBe('pruned');
+  if (outcome.kind !== 'pruned') return;
+  expect(outcome.summary).toContain('HIGH relevance');
+  expect(outcome.summary).not.toContain('LOW relevance');
+  expect(outcome.estimatedTokens).toBeLessThanOrEqual(900);
+  expect(outcome.details).toMatchObject({
+    targetTokens: 900, targetChars: 100_000, effectiveTokens: 900, effectiveChars: 100_000,
+    limitTokens: 272_000, limitChars: 816_000,
+  });
+});
+
+test('retains a large opaque native checkpoint once across repeated metadata resumes', async () => {
+  const archive = await memory();
+  const config = resolveConfig({ preserveRecentMessages: 0 }, {});
+  const budget = capacityBudget({ capacityTokens: 272_000, defaultTokens: 20_000, defaultChars: 100_000 });
+  const native = `<conversation-checkpoint>\n<summary>\n${'Original native user constraint. '.repeat(4400)}\n</summary>\n</conversation-checkpoint>`;
+  const tail = '[User]: Keep the historical receipt 4931 and never edit generated files.';
+  let requests = 0;
+  const asker: JevAsker = {
+    async ask(state, questions) { requests++; return stale.ask(state, questions); },
+  };
+  const first = await pruneForCheckpoint([
+    { id: 'native', role: 'user', content: [{ type: 'compaction', text: native }] },
+    { id: 'old', role: 'assistant', content: [{ type: 'text', text: 'Obsolete native exploration.' }] },
+  ], config, asker, { archive, sessionID: 'large-native-resume' }, budget);
+  expect(first.kind).toBe('pruned');
+  if (first.kind !== 'pruned') return;
+  const second = await pruneForCheckpoint([{
+    id: 'checkpoint-one', role: 'user', metadata: { fastJevCompaction: { version: 1, manifestID: first.manifestID } },
+    content: [{ type: 'text', text: `<conversation-checkpoint>\n<summary>\n${first.summary}\n</summary>\n\n<recent-context>\n${tail}\n</recent-context>\n</conversation-checkpoint>` }],
+  }], config, asker, { archive, sessionID: 'large-native-resume' }, budget);
+  expect(second.kind).toBe('pruned');
+  if (second.kind !== 'pruned') return;
+  const third = await pruneForCheckpoint([{
+    id: 'checkpoint-two', role: 'user', metadata: { fastJevCompaction: { version: 1, manifestID: second.manifestID } },
+    content: [{ type: 'text', text: second.summary }],
+  }], config, asker, { archive, sessionID: 'large-native-resume' }, budget);
+  expect(third.kind).toBe('pruned');
+  if (third.kind !== 'pruned') return;
+  for (const summary of [first.summary, second.summary, third.summary]) {
+    expect(summary.split(native)).toHaveLength(2);
+    expect(summary.match(/Earlier conversation selected/g)).toHaveLength(1);
+    expect(summary).not.toContain('Obsolete native exploration.');
+  }
+  expect(third.summary.split(tail)).toHaveLength(2);
+  expect(third.summary).toBe(second.summary);
+  expect(requests).toBe(1);
+  const hits = await archive.search('large-native-resume', 'Obsolete native exploration');
+  expect(hits).toHaveLength(1);
+  expect((await archive.read('large-native-resume', hits[0]!.id, 0, 8000)).text).toContain('Obsolete native exploration.');
 });
 
 test('reuses unchanged assessments but re-evaluates after the Jev model changes', async () => {

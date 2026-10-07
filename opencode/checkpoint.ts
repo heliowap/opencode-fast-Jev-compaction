@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { fromOpenCode, renderTranscript, type OcMessage } from './adapter.js';
 import type { ArchiveEntry, ArchiveInput, ArchiveManifest, MemoryArchive } from './archive.js';
-import { checkpointOverflow, checkpointTokens } from './budget.js';
+import { checkpointOverflow, checkpointTokens, effectiveBudget, fixedBudget, type CheckpointBudget } from './budget.js';
 import type { PluginConfig, Outcome } from './index.js';
 import { noulAnswer } from '../src/request.js';
 import { decideCall, resolveOptions } from '../src/compact.js';
@@ -104,6 +104,7 @@ async function classify(
 
 export async function recoverableCheckpoint(
   messages: readonly OcMessage[], config: PluginConfig, asker: JevAsker, memory: CheckpointMemory,
+  budget: CheckpointBudget = fixedBudget(config.maxSummaryTokens, config.maxSummaryChars),
 ): Promise<Outcome> {
   const started = Date.now();
   const run = randomUUID();
@@ -198,9 +199,10 @@ export async function recoverableCheckpoint(
   ]));
   const protectedMessages = entries.filter((e) => !textCandidates.has(e.id) && !toolCandidates.has(e.id)).map((e) => e.message);
   const framing = `${HEADER}\n\n[fast-jev-memory v1 ${'0'.repeat(64)}]\n\n`;
-  const floor = checkpointOverflow(framing + renderTranscript(protectedMessages).split('\n\n').slice(1).join('\n\n'),
-    config.maxSummaryTokens, config.maxSummaryChars);
-  if (floor) return { kind: 'fallback', reason: `protected ${floor}` };
+  const { overflow: floor, ...budgetDetails } = effectiveBudget(budget,
+    framing + renderTranscript(protectedMessages).split('\n\n').slice(1).join('\n\n'));
+  const { effectiveTokens, effectiveChars } = budgetDetails;
+  if (floor) return { kind: 'fallback', reason: `protected ${floor}`, details: { archiveMs, ...budgetDetails } };
   const decisions = new Map<string, CompactResult['decisions'][number]>();
   for (const call of calls) {
     const row = rows.get(entries[call.callIndex]!.id)!;
@@ -271,7 +273,7 @@ export async function recoverableCheckpoint(
   ].sort((a, b) => a.score - b.score);
   let body = bodyFor();
   for (const item of removable) {
-    if (!checkpointOverflow(framing + body, config.maxSummaryTokens, config.maxSummaryChars)) break;
+    if (!checkpointOverflow(framing + body, effectiveTokens, effectiveChars)) break;
     for (const id of item.ids) rows.get(id)!.mode = 'off';
     body = bodyFor();
   }
@@ -298,8 +300,8 @@ export async function recoverableCheckpoint(
       ms: Date.now() - started,
     },
   };
-  const overflow = checkpointOverflow(summary, config.maxSummaryTokens, config.maxSummaryChars);
-  const details = { archiveMs, prepareMs, jevMs, selectionMs: Date.now() - selectionStart, assessmentsReused,
+  const overflow = checkpointOverflow(summary, effectiveTokens, effectiveChars);
+  const details = { ...budgetDetails, archiveMs, prepareMs, jevMs, selectionMs: Date.now() - selectionStart, assessmentsReused,
     textsArchived: entries.filter((e) => textCandidates.has(e.id) && rows.get(e.id)!.mode === 'off').length };
   if (overflow) return { kind: 'fallback', reason: overflow, result, details };
   return { kind: 'pruned', summary, result, manifestID, estimatedTokens: checkpointTokens(summary), details };

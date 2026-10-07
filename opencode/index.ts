@@ -6,7 +6,7 @@ import { JevClient } from '../src/client.js';
 import { compact, reductionRatio } from '../src/compact.js';
 import { DEFAULT_MODEL } from '../src/request.js';
 import type { CompactOptions, CompactResult, JevAsker } from '../src/types.js';
-import { checkpointOverflow, checkpointTokens } from './budget.js';
+import { capacityBudget, checkpointOverflow, checkpointTokens, fixedBudget, type CheckpointBudget } from './budget.js';
 import { recoverableCheckpoint, type CheckpointMemory } from './checkpoint.js';
 import { MemoryArchive } from './archive.js';
 
@@ -61,7 +61,7 @@ export function resolveConfig(options: Record<string, unknown>, env = process.en
     provider,
     model: optionString(options.model) ?? (zen ? OPENCODE_ZEN_FREE_MODEL : DEFAULT_MODEL),
     minReductionRatio: optionNumber(options.minReductionRatio, 0.25),
-    maxSummaryChars: optionNumber(options.maxSummaryChars, 100_000),
+    maxSummaryChars: Math.max(0, Math.floor(optionNumber(options.maxSummaryChars, 100_000))),
     maxSummaryTokens: Math.max(0, Math.floor(optionNumber(options.maxSummaryTokens, 20_000))),
     memory: options.memory !== false,
     memoryDirectory: optionString(options.memoryDirectory) ?? '.jev-memory',
@@ -117,13 +117,14 @@ export async function pruneForCheckpoint(
   config: PluginConfig,
   asker: JevAsker,
   memory?: CheckpointMemory,
+  budget?: CheckpointBudget,
 ): Promise<Outcome> {
   if (config.provider === 'typesafe' && !config.apiKey) {
     return { kind: 'fallback', reason: 'TYPESAFE_API_KEY is not configured' };
   }
   const unsupported = unsupportedReason(messages);
   if (unsupported) return { kind: 'fallback', reason: unsupported };
-  if (memory) return recoverableCheckpoint(messages, config, asker, memory);
+  if (memory) return recoverableCheckpoint(messages, config, asker, memory, budget);
   const transcript = fromOpenCode(messages);
   const result = await compact(transcript, asker, config);
   const summary = renderTranscript(result.messages);
@@ -156,6 +157,8 @@ export default {
   id: 'fast-jev-compaction',
   async setup(ctx: Ctx) {
     const config = resolveConfig(ctx.options);
+    const explicitTokens = typeof ctx.options.maxSummaryTokens === 'number' && Number.isFinite(ctx.options.maxSummaryTokens);
+    const explicitChars = typeof ctx.options.maxSummaryChars === 'number' && Number.isFinite(ctx.options.maxSummaryChars);
     const asker = jevAsker(config);
     const archiveFor = async (sessionID: string): Promise<CheckpointMemory> => {
       let root = await ctx.storage.get(`memory/${sessionID}`);
@@ -208,34 +211,49 @@ export default {
     console.log(`[fast-jev-compaction] Jev: ${describeProvider(config)}`);
     await ctx.session.hook('compaction', async (event) => {
       let outcome: Outcome;
-      let budget = config.maxSummaryTokens;
+      let budget = fixedBudget(config.maxSummaryTokens, config.maxSummaryChars);
+      let capacityTokens: number | null = null;
+      let inputWindowTokens: number | null = null;
+      let overheadTokens: number | null = null;
       let budgetSource = 'configured target; retained-tail reserve is an assumption';
       try {
         const session = await ctx.session.get({ sessionID: event.sessionID });
         try {
           const catalog = await ctx.model.list({ location: { directory: session.location.directory } });
           const model = catalog.data.find((m) => m.providerID === event.model.providerID && m.id === event.model.id);
-          const window = model?.limit.input || model?.limit.context;
-          if (window && window > 0) {
-            const overhead = checkpointTokens(JSON.stringify({ system: event.system, tools: event.tools }));
-            budget = Math.max(0, Math.min(budget, window - overhead - config.recentReserveTokens - config.workingReserveTokens));
+          const input = model?.limit.input;
+          const window = typeof input === 'number' && Number.isFinite(input) && input > 0 ? input : model?.limit.context;
+          if (typeof window === 'number' && Number.isFinite(window) && window > 0) {
+            inputWindowTokens = window;
+            overheadTokens = checkpointTokens(JSON.stringify({ system: event.system, tools: event.tools }));
+            capacityTokens = Math.max(0, Math.floor(window - overheadTokens - config.recentReserveTokens - config.workingReserveTokens));
+            budget = capacityBudget({ capacityTokens, defaultTokens: config.maxSummaryTokens, defaultChars: config.maxSummaryChars,
+              ...(explicitTokens ? { explicitTokens: config.maxSummaryTokens } : {}),
+              ...(explicitChars ? { explicitChars: config.maxSummaryChars } : {}),
+            });
+            if (!config.memory) budget = fixedBudget(budget.targetTokens, budget.targetChars);
             budgetSource = 'model limit minus estimated system/tools and configured reserves';
           }
         } catch {
           budgetSource = 'configured target; model limit unavailable';
         }
-        outcome = await pruneForCheckpoint(event.messages, { ...config, maxSummaryTokens: budget }, asker,
-          config.memory ? await archiveFor(event.sessionID) : undefined);
+        outcome = await pruneForCheckpoint(event.messages, { ...config, maxSummaryTokens: budget.targetTokens, maxSummaryChars: budget.targetChars }, asker,
+          config.memory ? await archiveFor(event.sessionID) : undefined, budget);
       } catch (error) {
         outcome = { kind: 'fallback', reason: error instanceof Error ? error.message : String(error) };
       }
+      const budgetTokens = outcome.details?.effectiveTokens ?? budget.targetTokens;
+      const budgetMetadata = { ...budget, capacityTokens, explicitTokens, explicitChars,
+        inputWindowTokens, overheadTokens, recentReserveTokens: config.recentReserveTokens, workingReserveTokens: config.workingReserveTokens,
+      };
       try {
         await ctx.storage.set(`last/${event.sessionID}`, {
           at: new Date().toISOString(),
           kind: outcome.kind,
           reason: outcome.kind === 'fallback' ? outcome.reason : null,
           stats: { ...stats(outcome.result), ...outcome.details },
-          budgetTokens: budget,
+          budgetTokens,
+          budget: budgetMetadata,
           budgetSource,
           ...(outcome.kind === 'pruned' ? { estimatedTokens: outcome.estimatedTokens ?? checkpointTokens(outcome.summary) } : {}),
         });
@@ -252,7 +270,7 @@ export default {
         summary: outcome.summary,
         metadata: { fastJevCompaction: { ...stats(outcome.result), ...outcome.details,
           ...(outcome.manifestID ? { version: 1, manifestID: outcome.manifestID } : {}),
-          budgetTokens: budget, budgetSource, estimatedTokens: outcome.estimatedTokens ?? checkpointTokens(outcome.summary),
+          budgetTokens, budget: budgetMetadata, budgetSource, estimatedTokens: outcome.estimatedTokens ?? checkpointTokens(outcome.summary),
         } },
       };
     });

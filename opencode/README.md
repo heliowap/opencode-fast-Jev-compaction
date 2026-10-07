@@ -96,15 +96,32 @@ rule. Use a dedicated `memoryDirectory`, never an existing project/home director
 ## Checkpoint budget
 
 Acceptance depends on final rendered size, including instructions and pointers, not percentage
-reduction. The plugin caps `maxSummaryTokens` using the selected model's input/context limit when
-available, subtracting estimated system/tool overhead and configured recent/working reserves.
-It also honors `maxSummaryChars`. `minReductionRatio` is retained for configuration compatibility
-but no longer rejects fitting checkpoints.
+reduction. In recoverable mode, the default 20k-token / 100k-character budgets are **soft selection
+targets only when model capacity is known**. The hook uses the selected event model's finite,
+positive input limit, or its context limit if the input limit is invalid. Usable checkpoint capacity
+is `max(0, floor(window - estimated system/tool overhead - recent reserve - working reserve))`.
+Without an explicit character cap, its estimated character limit is three times that token capacity.
+
+Selection still aims for the configured targets, capped by capacity. If protected blocks and framing
+alone exceed a target, the effective budget expands only to `max(target, protected floor)`, bounded
+by the capacity and explicit caps. It does **not** fill the entire available model window. This lets
+a large opaque native checkpoint remain verbatim while eligible old content is still removed.
+Finite numeric `maxSummaryTokens` and `maxSummaryChars` options are hard caps, **even when explicitly
+set to the defaults**; they are normalized to nonnegative integers before use. Missing, non-number
+and non-finite options leave the defaults soft. A protected floor above a hard limit falls back
+before Jev inference.
+
+When model lookup fails, no matching model exists, or neither window is valid, the configured
+targets remain fixed limits (20k tokens / 100k characters by default); there is no adaptive expansion.
+Legacy `memory: false` still prunes tools and checks the final checkpoint against fixed targets,
+capped by known capacity, without adapting to the protected floor. `minReductionRatio` is retained
+for configuration compatibility but no longer rejects fitting checkpoints.
 
 Checkpoint tokens are conservatively estimated as the larger of the library estimate and
 `ceil(characters / 3)`. This is **not** the provider's tokenizer. The hook does not expose the actual
 separately retained tail or resolved OpenCode compaction buffer; the default 20k-token tail reserve
-is an explicit assumption, not a fit guarantee. Increase it when using a larger native keep window.
+is an explicit assumption, not a hard provider-fit guarantee. System/tool overhead and the working
+reserve are estimates too. Increase the recent reserve when using a larger native keep window.
 For small input windows, configure smaller reserves only if the actual tail/workload permits it.
 If model lookup is unavailable, the configured checkpoint target still applies and diagnostics say
 so. `event.options.maxTokens` is an output setting and is not used as an input budget.
@@ -122,14 +139,22 @@ The hook leaves the result unset, so OpenCode writes its built-in summary, when:
 - archive/root-registration persistence fails, or a referenced manifest is missing, corrupt,
   unsupported or belongs to another session;
 - the host's retained-context wrapper is ambiguous, or a newly removed original fails confirmation;
-- the protected context alone exceeds the estimated budget (detected before inference in
-  recoverable mode; legacy `memory: false` checks the final checkpoint after tool classification);
-- the final checkpoint cannot fit `maxSummaryTokens` or `maxSummaryChars`.
+- the protected context alone exceeds estimated model capacity or a hard checkpoint limit (detected
+  before inference in recoverable mode; legacy `memory: false` checks the final checkpoint after tool classification);
+- the final checkpoint cannot fit the effective token or character budget.
 
 The reason is logged as a warning. The outcome of the last compaction per session is kept in the
 plugin storage under `last/<sessionID>` on a best-effort basis. **Diagnostic** write failures do not
 prevent compaction; original/manifest/root-registration failures do. Successful runs add
 `metadata.fastJevCompaction`, including the manifest and timings, to the compaction message.
+Both diagnostics and successful compaction metadata include a nested `budget` with initial
+`targetTokens`/`targetChars`, hard `limitTokens`/`limitChars`, `capacityTokens` (null when unknown),
+`explicitTokens`/`explicitChars` flags, the input window, estimated overhead and configured reserves.
+Recoverable outcomes also report `protectedTokens`/`protectedChars` and
+`effectiveTokens`/`effectiveChars` in their numeric details. Top-level `budgetTokens` reports the
+effective budget when available, otherwise the selection target; `estimatedTokens` is the actual
+checkpoint estimate on success. These metrics expose the budget assumptions rather than asserting
+that the provider's tokenizer or separately retained tail will fit exactly.
 
 The full checkpoint is still displayed by OpenCode's built-in compaction renderer. The supported
 2.0.22 CLI plugin interface cannot replace just that body. This fork does not claim to hide the dump
@@ -196,11 +221,11 @@ Pass options with the object form in `opencode.json(c)`:
 | `goal` | protected user history | Additional current-task description; user revisions still count |
 | `memory` | `true` | Recoverable selection; `false` uses legacy tool-only pruning |
 | `memoryDirectory` | `.jev-memory` | Local archive path, initially resolved against the session directory |
-| `maxSummaryTokens` | `20000` | Estimated final checkpoint target, further capped by model limits |
+| `maxSummaryTokens` | `20000` | Soft default selection target with known capacity in recoverable mode; explicit finite values are hard caps |
 | `recentReserveTokens` | `20000` | Assumed allowance for the host's separately retained tail |
 | `workingReserveTokens` | `10000` | Space reserved for continuation and framing |
 | `minReductionRatio` | `0.25` | Deprecated compatibility option; reduction is diagnostic only |
-| `maxSummaryChars` | `100000` | Additional final checkpoint character cap |
+| `maxSummaryChars` | `100000` | Soft default character target with known capacity in recoverable mode; explicit finite values are hard caps |
 
 Missing, non-number, and non-finite numeric options use the defaults above.
 

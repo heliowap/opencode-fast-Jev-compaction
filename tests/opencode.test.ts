@@ -367,3 +367,243 @@ test('caps the checkpoint budget using the selected model and explicit reserves'
   const record = set.mock.calls.find(([key]) => key === 'last/session-test')![1] as { budgetTokens: number };
   expect(record.budgetTokens).toBeLessThan(2000);
 });
+
+test('manual compaction preserves a large native checkpoint that fits the model instead of falling back', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const fetcher = vi.fn<typeof fetch>(async (_input, init) => {
+    const { state, questions } = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify(await dropAll.ask(state, questions)));
+  });
+  vi.stubGlobal('fetch', fetcher);
+  const { hook, event, ctx, set, tools } = await setupHook({ memory: true });
+  ctx.model.list.mockResolvedValue({ data: [{
+    providerID: 'example', id: 'model', limit: { context: 400000, input: 272000, output: 128000 },
+  }] as Awaited<ReturnType<typeof ctx.model.list>>['data'], location: { directory: '/unused' } });
+  const opaque = `<conversation-checkpoint>\n<summary>\nPrevious native summary.\n</summary>\n\n<recent-context>\n[User]: Never remove audit logs.\n[Tool result]: ${'historical evidence '.repeat(7000)}\n</recent-context>\n</conversation-checkpoint>`;
+  const staleText = 'Obsolete investigation of the discarded approach. '.repeat(1500);
+  event.messages = [
+    { role: 'user', content: [{ type: 'text', text: opaque }] },
+    { role: 'assistant', content: [{ type: 'text', text: staleText }] },
+    ...Array.from({ length: 6 }, () => ({ role: 'assistant', content: [{ type: 'text', text: 'Current protected progress.' }] })),
+  ] as SessionCompaction['messages'];
+  await hook(event);
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({ kind: 'pruned' }));
+  expect(event.result?.summary).toContain(opaque);
+  expect(event.result?.summary).not.toContain(staleText);
+  expect(fetcher).toHaveBeenCalled();
+  const search = tools.find((tool) => tool.name === 'fast_jev_memory_search')!;
+  const read = tools.find((tool) => tool.name === 'fast_jev_memory_read')!;
+  const call = { sessionID: event.sessionID } as Parameters<Info['execute']>[1];
+  const found = JSON.parse(String((await search.execute({ query: 'Obsolete investigation' }, call)).content));
+  expect(found.length).toBeGreaterThan(0);
+  expect(String((await read.execute({ id: found[0].id, limit: 8000 }, call)).content)).toContain('discarded approach');
+});
+
+test.each([
+  { maxSummaryTokens: 20000, maxSummaryChars: 500000 },
+  { maxSummaryTokens: 100000, maxSummaryChars: 100000 },
+])('explicit checkpoint limits remain mandatory with a large model (%j)', async (limits) => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const fetcher = vi.fn<typeof fetch>();
+  vi.stubGlobal('fetch', fetcher);
+  const { hook, event, ctx, set } = await setupHook({ memory: true, ...limits });
+  ctx.model.list.mockResolvedValue({ data: [{
+    providerID: 'example', id: 'model', limit: { context: 400000, input: 272000, output: 128000 },
+  }] as Awaited<ReturnType<typeof ctx.model.list>>['data'], location: { directory: '/unused' } });
+  event.messages = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(140000) }] }] as SessionCompaction['messages'];
+  await hook(event);
+  expect(event.result).toBeUndefined();
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'fallback', reason: expect.stringMatching(/^protected checkpoint /),
+  }));
+});
+
+test('does not expand the default target when the model capacity is unknown', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const { hook, event, set } = await setupHook({ memory: true });
+  event.messages = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(140000) }] }] as SessionCompaction['messages'];
+  await hook(event);
+  expect(event.result).toBeUndefined();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'fallback', budgetTokens: 20000,
+  }));
+});
+
+test('reports the protected minimum when it exceeds the usable model capacity', async () => {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const fetcher = vi.fn<typeof fetch>();
+  vi.stubGlobal('fetch', fetcher);
+  const { hook, event, ctx, set } = await setupHook({ memory: true });
+  ctx.model.list.mockResolvedValue({ data: [{
+    providerID: 'example', id: 'model', limit: { context: 400000, input: 40000, output: 128000 },
+  }] as Awaited<ReturnType<typeof ctx.model.list>>['data'], location: { directory: '/unused' } });
+  event.messages = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(140000) }] }] as SessionCompaction['messages'];
+  await hook(event);
+  expect(event.result).toBeUndefined();
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'fallback', stats: expect.objectContaining({ protectedTokens: expect.any(Number), protectedChars: expect.any(Number) }),
+  }));
+});
+
+async function setupBudgetHook(options: Record<string, unknown> = {}, input = 272000, context = 400000) {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const fetcher = vi.fn<typeof fetch>(async (_input, init) => {
+    const { state, questions } = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify(await keepAll.ask(state, questions)));
+  });
+  vi.stubGlobal('fetch', fetcher);
+  const fixture = await setupHook({ memory: true, ...options });
+  fixture.ctx.model.list.mockResolvedValue({ data: [{
+    providerID: 'example', id: 'model', limit: { context, input, output: 128000 },
+  }] as Awaited<ReturnType<typeof fixture.ctx.model.list>>['data'], location: { directory: '/unused' } });
+  return { ...fixture, fetcher };
+}
+
+function budgetHistory(protectedChars: number): SessionCompaction['messages'] {
+  return [
+    { role: 'user', content: [{ type: 'text', text: 'x'.repeat(protectedChars) }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'Optional old investigation. '.repeat(3000) }] },
+    ...Array.from({ length: 6 }, () => ({ role: 'assistant', content: [{ type: 'text', text: 'Current protected progress.' }] })),
+  ] as SessionCompaction['messages'];
+}
+
+test('reports the effective protected-floor budget without consuming the whole model capacity', async () => {
+  const { hook, event, set, fetcher } = await setupBudgetHook();
+  event.messages = budgetHistory(140000);
+  await hook(event);
+  expect(event.result?.summary).toContain('x'.repeat(140000));
+  expect(event.result?.summary).not.toContain('Optional old investigation.');
+  expect(fetcher).toHaveBeenCalled();
+  const metadata = event.result?.metadata?.fastJevCompaction as {
+    budgetTokens: number; effectiveTokens: number; effectiveChars: number; protectedTokens: number; protectedChars: number;
+    estimatedTokens: number; targetTokens: number; budget: { capacityTokens: number; overheadTokens: number };
+  };
+  expect(metadata).toMatchObject({
+    targetTokens: 20000, targetChars: 100000,
+    budget: { targetTokens: 20000, targetChars: 100000, limitChars: expect.any(Number), limitTokens: expect.any(Number),
+      inputWindowTokens: 272000, overheadTokens: expect.any(Number), recentReserveTokens: 20000, workingReserveTokens: 10000,
+      explicitTokens: false, explicitChars: false },
+  });
+  expect(metadata.budgetTokens).toBe(metadata.effectiveTokens);
+  expect(metadata.effectiveTokens).toBe(metadata.protectedTokens);
+  expect(metadata.effectiveChars).toBe(metadata.protectedChars);
+  expect(metadata.budgetTokens).toBeGreaterThan(20000);
+  expect(metadata.budgetTokens).toBeLessThan(metadata.budget.capacityTokens);
+  expect(metadata.estimatedTokens).toBeLessThanOrEqual(metadata.budgetTokens);
+  expect(metadata.budget.capacityTokens).toBe(272000 - metadata.budget.overheadTokens - 30000);
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'pruned', budgetTokens: metadata.budgetTokens, budget: metadata.budget,
+    stats: expect.objectContaining({ protectedTokens: metadata.protectedTokens, protectedChars: metadata.protectedChars }),
+  }));
+});
+
+test('keeps the 20k selection target when a small protected floor fits a large model', async () => {
+  const { hook, event } = await setupBudgetHook();
+  event.messages = budgetHistory(100);
+  await hook(event);
+  expect(event.result?.summary).toContain('x'.repeat(100));
+  expect(event.result?.summary).not.toContain('Optional old investigation.');
+  expect(event.result?.metadata?.fastJevCompaction).toMatchObject({
+    budgetTokens: 20000, effectiveTokens: 20000,
+    budget: { targetTokens: 20000, inputWindowTokens: 272000, explicitTokens: false, explicitChars: false },
+  });
+});
+
+test.each(['empty', 'throwing', 'invalid'] as const)('keeps conservative defaults for a %s model catalogue', async (catalogue) => {
+  const { hook, event, ctx, set, fetcher } = await setupBudgetHook({}, NaN, Infinity);
+  if (catalogue === 'empty') ctx.model.list.mockResolvedValue({ data: [], location: { directory: '/unused' } });
+  if (catalogue === 'throwing') ctx.model.list.mockRejectedValue(new Error('catalogue unavailable'));
+  event.messages = budgetHistory(140000);
+  await hook(event);
+  expect(event.result).toBeUndefined();
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'fallback', budgetTokens: 20000,
+    budgetSource: catalogue === 'throwing' ? 'configured target; model limit unavailable' : 'configured target; retained-tail reserve is an assumption',
+    budget: expect.objectContaining({ targetTokens: 20000, targetChars: 100000, limitTokens: 20000, limitChars: 100000,
+      capacityTokens: null, inputWindowTokens: null, overheadTokens: null, explicitTokens: false, explicitChars: false }),
+  }));
+});
+
+test('non-finite explicit options leave the defaults soft with known capacity', async () => {
+  const { hook, event } = await setupBudgetHook({ maxSummaryTokens: NaN, maxSummaryChars: Infinity });
+  event.messages = budgetHistory(140000);
+  await hook(event);
+  expect(event.result?.summary).toContain('x'.repeat(140000));
+  expect(event.result?.metadata?.fastJevCompaction).toMatchObject({
+    budget: { targetTokens: 20000, targetChars: 100000, explicitTokens: false, explicitChars: false },
+  });
+});
+
+test('zero usable capacity falls back before inference rather than reverting to defaults', async () => {
+  const { hook, event, set, fetcher } = await setupBudgetHook({}, 1000);
+  await hook(event);
+  expect(event.result).toBeUndefined();
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'fallback', budgetTokens: 0,
+    budget: expect.objectContaining({ capacityTokens: 0, targetTokens: 0, limitTokens: 0, targetChars: 0, limitChars: 0 }),
+  }));
+});
+
+test('uses the selected input window rather than the larger context or another catalogue model', async () => {
+  const { hook, event, ctx, set, fetcher } = await setupBudgetHook();
+  const catalog = await ctx.model.list();
+  ctx.model.list.mockResolvedValue({ ...catalog, data: [
+    { ...catalog.data[0]!, providerID: 'other', limit: { input: 1000000, context: 1000000, output: 1000 } },
+    { ...catalog.data[0]!, id: 'other', limit: { input: 1000000, context: 1000000, output: 1000 } },
+    ...catalog.data,
+  ] as typeof catalog.data });
+  event.messages = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(800000) }] }] as SessionCompaction['messages'];
+  await hook(event);
+  expect(event.result).toBeUndefined();
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'fallback', reason: expect.stringMatching(/^protected checkpoint /),
+    budget: expect.objectContaining({ inputWindowTokens: 272000 }),
+  }));
+});
+
+test.each([0, -1, NaN, Infinity])('uses a valid context window when the input window is invalid (%s)', async (input) => {
+  const { hook, event } = await setupBudgetHook({}, input, 272000);
+  event.messages = budgetHistory(140000);
+  await hook(event);
+  expect(event.result?.summary).toContain('x'.repeat(140000));
+  expect(event.result?.metadata?.fastJevCompaction).toMatchObject({ budget: { inputWindowTokens: 272000 } });
+});
+
+test.each([
+  { maxSummaryTokens: -1, maxSummaryChars: 100000.9 },
+  { maxSummaryTokens: 20000.9, maxSummaryChars: -0.5 },
+])('normalizes finite explicit limits before applying hard caps (%j)', async (options) => {
+  const { hook, event, set, fetcher } = await setupBudgetHook(options);
+  await hook(event);
+  expect(event.result).toBeUndefined();
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'fallback', budget: expect.objectContaining({
+      limitTokens: Math.max(0, Math.floor(options.maxSummaryTokens)),
+      limitChars: Math.max(0, Math.floor(options.maxSummaryChars)), explicitTokens: true, explicitChars: true,
+    }),
+  }));
+});
+
+test('legacy pruning does not adapt a protected floor to a large model', async () => {
+  const { hook, event, set, fetcher } = await setupBudgetHook({ memory: false });
+  event.messages = budgetHistory(140000);
+  await hook(event);
+  expect(event.result).toBeUndefined();
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(set).toHaveBeenCalledWith('last/session-test', expect.objectContaining({
+    kind: 'fallback', budgetTokens: 20000,
+    reason: expect.stringMatching(/^checkpoint /),
+    budget: expect.objectContaining({ targetTokens: 20000, targetChars: 100000, limitTokens: 20000, limitChars: 100000 }),
+  }));
+});
