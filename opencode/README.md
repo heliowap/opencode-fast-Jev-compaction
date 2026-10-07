@@ -113,10 +113,12 @@ The hook leaves the result unset, so OpenCode writes its built-in summary, when:
 - the history holds content that cannot be rendered as text without loss: an encrypted compaction
   checkpoint (OpenAI Responses native compaction), a checkpoint without text, or encrypted
   reasoning;
-- Jev fails, answers malformed, or takes more than 60 s;
+- Jev fails, answers malformed, or an individual request takes more than 60 s. Each request has its
+  own timeout; multiple waves of batches can make total inference time exceed 60 s;
 - archive/root-registration persistence fails, or a referenced manifest is missing, corrupt,
   unsupported or belongs to another session;
-- the protected context alone exceeds the estimated budget (detected before inference);
+- the protected context alone exceeds the estimated budget (detected before inference in
+  recoverable mode; legacy `memory: false` checks the final checkpoint after tool classification);
 - the final checkpoint cannot fit `maxSummaryTokens` or `maxSummaryChars`.
 
 The reason is logged as a warning. The outcome of the last compaction per session is kept in the
