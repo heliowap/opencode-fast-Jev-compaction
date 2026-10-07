@@ -116,16 +116,20 @@ export async function recoverableCheckpoint(
       if (previous || checkpoint.version !== 1 || typeof checkpoint.manifestID !== 'string') {
         throw new Error('Invalid fast-jev memory checkpoint');
       }
+      const text = message.content.map((p) => p.type === 'text' ? p.text : '').join('');
+      const boundary = '\n</summary>\n\n<recent-context>\n';
+      const boundaryCount = text.split(boundary).length - 1;
+      const tailEnd = '\n</recent-context>\n</conversation-checkpoint>';
+      const hasTailEnd = text.endsWith(tailEnd);
+      if (!(boundaryCount === 0 && !hasTailEnd) && !(boundaryCount === 1 && hasTailEnd)) {
+        throw new Error('Ambiguous fast-jev memory checkpoint recent context');
+      }
       previous = await memory.archive.restore(memory.sessionID, checkpoint.manifestID);
       restored.push(...await Promise.all(previous.entries.filter((e) => e.mode !== 'off')
         .map((e) => memory.archive.get(memory.sessionID, e.id))));
-      const text = message.content.map((p) => p.type === 'text' ? p.text : '').join('');
-      const boundary = '\n</summary>\n\n<recent-context>\n';
-      const tailStart = text.lastIndexOf(boundary);
-      const tailEnd = '\n</recent-context>\n</conversation-checkpoint>';
-      if (tailStart >= 0 && text.endsWith(tailEnd)) {
+      if (boundaryCount === 1) {
         inputs.push({ source: `${message.id ?? run}:recent`,
-          message: { role: 'user', text: text.slice(tailStart + boundary.length, -tailEnd.length), toolUses: [] },
+          message: { role: 'user', text: text.slice(text.indexOf(boundary) + boundary.length, -tailEnd.length), toolUses: [] },
           original: { role: 'user', part: { type: 'compaction' } },
         });
       }

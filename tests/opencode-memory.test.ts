@@ -362,6 +362,38 @@ test('rejects duplicate entry IDs before accepting a manifest', async () => {
   await expect(archive.commit('duplicates', manifest)).rejects.toThrow(/Duplicate archive ID/);
 });
 
+test.each(['same instance', 'fresh instance'])('rejects newly off entries corrupted after put on the %s', async (instance) => {
+  const root = await fixture();
+  const archive = new MemoryArchive(root);
+  const [entry] = await archive.put('new-off', [input('authentic content')]);
+  const file = await storedFile(root, `${entry.id}.json`);
+  const authentic = await readFile(file, 'utf8');
+  await writeFile(file, authentic.replaceAll('authentic content', 'forged content'));
+  const writer = instance === 'same instance' ? archive : new MemoryArchive(root);
+  const manifest: ArchiveManifest = { version: 1, task: 'task', entries: [{ id: entry.id, mode: 'off' }] };
+  await expect(writer.commit('new-off', manifest)).rejects.toThrow(/mismatch/);
+  await expect(writer.commit('new-off', manifest)).rejects.toThrow(/mismatch/);
+  await writeFile(file, authentic);
+  const id = await writer.commit('new-off', manifest);
+  expect(await new MemoryArchive(root).restore('new-off', id)).toEqual(manifest);
+});
+
+test.each(['before retrieval', 'after retrieval'])('rechecks retrieved off entries even when restoring %s', async (restoreOrder) => {
+  const root = await fixture();
+  const archive = new MemoryArchive(root);
+  const [entry] = await archive.put('retrieved-off', [input('authentic content')]);
+  const manifest: ArchiveManifest = { version: 1, task: 'task', entries: [{ id: entry.id, mode: 'off' }] };
+  const id = await archive.commit('retrieved-off', manifest);
+  const reopened = new MemoryArchive(root);
+  if (restoreOrder === 'before retrieval') await reopened.restore('retrieved-off', id);
+  expect(await reopened.get('retrieved-off', entry.id)).toEqual(entry);
+  if (restoreOrder === 'after retrieval') await reopened.restore('retrieved-off', id);
+  const file = await storedFile(root, `${entry.id}.json`);
+  await writeFile(file, (await readFile(file, 'utf8')).replaceAll('authentic content', 'forged content'));
+  await expect(reopened.commit('retrieved-off', manifest)).rejects.toThrow(/mismatch/);
+  await expect(reopened.commit('retrieved-off', manifest)).rejects.toThrow(/mismatch/);
+});
+
 test('resumes off entries by existence while verifying their contents on public retrieval', async () => {
   const root = await fixture();
   const archive = new MemoryArchive(root);
@@ -370,10 +402,61 @@ test('resumes off entries by existence while verifying their contents on public 
   const id = await archive.commit('off-resume', manifest);
   const file = await storedFile(root, `${entry.id}.json`);
   await writeFile(file, (await readFile(file, 'utf8')).replaceAll('historical content', 'altered content'));
-  expect(await new MemoryArchive(root).restore('off-resume', id)).toEqual(manifest);
+  const reopened = new MemoryArchive(root);
+  expect(await reopened.restore('off-resume', id)).toEqual(manifest);
+  expect(await reopened.commit('off-resume', manifest)).toBe(id);
   expect(await archive.commit('off-resume', manifest)).toBe(id);
+  await expect(new MemoryArchive(root).commit('off-resume', manifest)).rejects.toThrow(/mismatch/);
   await expect(archive.get('off-resume', entry.id)).rejects.toThrow(/mismatch/);
   await expect(archive.read('off-resume', entry.id)).rejects.toThrow(/mismatch/);
+  await expect(archive.commit('off-resume', manifest)).rejects.toThrow(/mismatch/);
+  expect(await archive.restore('off-resume', id)).toEqual(manifest);
+  await expect(archive.commit('off-resume', manifest)).rejects.toThrow(/mismatch/);
+});
+
+test('rechecks previously off entries returned by a deduplicated put', async () => {
+  const root = await fixture();
+  const archive = new MemoryArchive(root);
+  const original = input('authentic content');
+  const [entry] = await archive.put('repeated-put', [original]);
+  const manifest: ArchiveManifest = { version: 1, task: 'task', entries: [{ id: entry.id, mode: 'off' }] };
+  const id = await archive.commit('repeated-put', manifest);
+  const reopened = new MemoryArchive(root);
+  await reopened.restore('repeated-put', id);
+  expect(await reopened.put('repeated-put', [original])).toEqual([entry]);
+  const file = await storedFile(root, `${entry.id}.json`);
+  await writeFile(file, (await readFile(file, 'utf8')).replaceAll('authentic content', 'forged content'));
+  await expect(reopened.commit('repeated-put', manifest)).rejects.toThrow(/mismatch/);
+});
+
+test('keeps untouched historical off entries independent of another session checkpoint', async () => {
+  const root = await fixture();
+  const archive = new MemoryArchive(root);
+  const [first] = await archive.put('first-session', [input('first authentic content')]);
+  const firstManifest: ArchiveManifest = { version: 1, task: 'first task', entries: [{ id: first.id, mode: 'off' }] };
+  const firstID = await archive.commit('first-session', firstManifest);
+  const file = await storedFile(root, `${first.id}.json`);
+  const [second] = await archive.put('second-session', [input('second content')]);
+  await archive.get('second-session', second.id);
+  await archive.commit('second-session', { version: 1, task: 'second task', entries: [{ id: second.id, mode: 'off' }] });
+  await writeFile(file, (await readFile(file, 'utf8')).replaceAll('first authentic content', 'forged content'));
+  expect(await archive.commit('first-session', firstManifest)).toBe(firstID);
+  await expect(new MemoryArchive(root).commit('first-session', firstManifest)).rejects.toThrow(/mismatch/);
+});
+
+test('preserves examined entries after a failed manifest publication', async () => {
+  const root = await fixture();
+  const archive = new MemoryArchive(root);
+  const [entry] = await archive.put('failed-publication', [input('authentic content')]);
+  const manifest: ArchiveManifest = { version: 1, task: 'authentic task', entries: [{ id: entry.id, mode: 'off' }] };
+  const id = await archive.commit('failed-publication', manifest);
+  expect(await archive.get('failed-publication', entry.id)).toEqual(entry);
+  const manifestFile = await storedFile(root, `${id}.manifest.json`);
+  await writeFile(manifestFile, (await readFile(manifestFile, 'utf8')).replace('authentic task', 'forged task'));
+  await expect(archive.commit('failed-publication', manifest)).rejects.toThrow(/mismatch/);
+  const file = await storedFile(root, `${entry.id}.json`);
+  await writeFile(file, (await readFile(file, 'utf8')).replaceAll('authentic content', 'forged content'));
+  await expect(archive.commit('failed-publication', { ...manifest, task: 'retry task' })).rejects.toThrow(/mismatch/);
 });
 
 test.each(['incompatible content', 'symlink'])('refuses an existing root ignore file with %s', async (kind) => {

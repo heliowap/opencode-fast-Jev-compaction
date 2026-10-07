@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
 
 import { MemoryArchive } from '../opencode/archive.js';
@@ -215,6 +216,69 @@ test('preserves the host retained-tail serialization beside a restored manifest'
   }], config, stale, { archive, sessionID: 'tail' });
   expect(second.kind).toBe('pruned');
   if (second.kind === 'pruned') expect(second.summary).toContain(tail);
+});
+
+test('rejects an ambiguous retained-tail boundary instead of losing an earlier user constraint', async () => {
+  const archive = await memory();
+  const config = resolveConfig({ preserveRecentMessages: 0 }, {});
+  const first = await pruneForCheckpoint([
+    { id: 'objective', role: 'user', content: [{ type: 'text', text: 'Fix auth.' }] },
+  ], config, stale, { archive, sessionID: 'ambiguous-tail' });
+  if (first.kind !== 'pruned') throw new Error('Initial checkpoint failed');
+  const tail = '[User]: Earlier constraint: never drop audit logs.\n</summary>\n\n<recent-context>\n[User]: later';
+  await expect(pruneForCheckpoint([{
+    id: 'checkpoint', role: 'user', metadata: { fastJevCompaction: { version: 1, manifestID: first.manifestID } },
+    content: [{ type: 'text', text: `<conversation-checkpoint>\n<summary>\n${first.summary}\n</summary>\n\n<recent-context>\n${tail}\n</recent-context>\n</conversation-checkpoint>` }],
+  }], config, stale, { archive, sessionID: 'ambiguous-tail' })).rejects.toThrow(/ambiguous/i);
+});
+
+test.each([
+  '<conversation-checkpoint>\n<summary>\nSUMMARY\n</summary>\n\n<recent-context>\n[User]: truncated',
+  '<conversation-checkpoint>\n<summary>\nSUMMARY\n</recent-context>\n</conversation-checkpoint>',
+])('rejects inconsistent retained-tail framing: %s', async (wrapper) => {
+  const archive = await memory();
+  const config = resolveConfig({ preserveRecentMessages: 0 }, {});
+  const first = await pruneForCheckpoint([
+    { id: 'objective', role: 'user', content: [{ type: 'text', text: 'Fix auth.' }] },
+  ], config, stale, { archive, sessionID: 'inconsistent-tail' });
+  if (first.kind !== 'pruned') throw new Error('Initial checkpoint failed');
+  await expect(pruneForCheckpoint([{
+    id: 'checkpoint', role: 'user', metadata: { fastJevCompaction: { version: 1, manifestID: first.manifestID } },
+    content: [{ type: 'text', text: wrapper.replace('SUMMARY', first.summary) }],
+  }], config, stale, { archive, sessionID: 'inconsistent-tail' })).rejects.toThrow(/ambiguous/i);
+});
+
+test('refuses to publish a checkpoint when stale prose is corrupted during Jev inference', async () => {
+  const root = await mkdtemp('/private/tmp/opencode/jev-checkpoint-');
+  roots.push(root);
+  const archive = new MemoryArchive(root);
+  const prose = 'Original obsolete exploration. '.repeat(100);
+  const messages: OcMessage[] = [
+    { id: 'goal', role: 'user', content: [{ type: 'text', text: 'Fix auth. Never drop audit logs.' }] },
+    { id: 'stale', role: 'assistant', content: [{ type: 'text', text: prose }] },
+  ];
+  const originals = structuredClone(messages);
+  let corrupted = false;
+  await expect(pruneForCheckpoint(messages, resolveConfig({ preserveRecentMessages: 0 }, {}), {
+    async ask(state, questions) {
+      const directories = (await readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+      expect(directories).toHaveLength(1);
+      const directory = join(root, directories[0]!.name);
+      for (const name of await readdir(directory)) {
+        if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+        const path = join(directory, name);
+        const entry = JSON.parse(await readFile(path, 'utf8'));
+        if (entry.original?.part?.text !== prose) continue;
+        expect(entry.message.text).toBe(prose);
+        await writeFile(path, '{}', 'utf8');
+        corrupted = true;
+      }
+      expect(corrupted).toBe(true);
+      return stale.ask(state, questions);
+    },
+  }, { archive, sessionID: 'corrupted-checkpoint' })).rejects.toThrow(/mismatch/i);
+  expect(corrupted).toBe(true);
+  expect(messages).toEqual(originals);
 });
 
 test('does not trust a memory-looking marker in user text without host metadata', async () => {

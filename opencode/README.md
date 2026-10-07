@@ -75,12 +75,16 @@ that cannot be resolved falls back safely. Native/legacy textual checkpoints are
 protected text: their discarded originals cannot be reconstructed retroactively.
 The host's separately retained `<recent-context>` also arrives as serialized text, not structured
 parts. It is preserved as an opaque protected block rather than unsafely parsing user/tool labels.
+Ambiguous wrapper delimiters trigger native fallback instead of selecting a possibly incomplete tail.
 That protected floor can still grow and require native fallback; this is not yet a complete
 hierarchical memory replacement for every part of an OpenCode session.
 
 The plugin remembers the archive root using OpenCode's existing plugin storage, so moving a session
 does not silently redirect its pointers. Do not delete archives referenced by resumable sessions.
 There is no automatic expiration or pruning. Back them up together with the session data.
+Before publishing a checkpoint, newly removed or currently examined originals are hash-verified.
+Previously archived, untouched blocks are checked for existence on resume and verified on retrieval;
+their full contents are not reread on every compaction.
 
 **Privacy:** originals can contain credentials and other sensitive data. They are local plaintext,
 not encrypted or automatically redacted. Directories/files use private permissions and reject
@@ -117,6 +121,7 @@ The hook leaves the result unset, so OpenCode writes its built-in summary, when:
   own timeout; multiple waves of batches can make total inference time exceed 60 s;
 - archive/root-registration persistence fails, or a referenced manifest is missing, corrupt,
   unsupported or belongs to another session;
+- the host's retained-context wrapper is ambiguous, or a newly removed original fails confirmation;
 - the protected context alone exceeds the estimated budget (detected before inference in
   recoverable mode; legacy `memory: false` checks the final checkpoint after tool classification);
 - the final checkpoint cannot fit `maxSummaryTokens` or `maxSummaryChars`.
@@ -212,7 +217,8 @@ The package has no `build` or `prepare` script on purpose. When it installs a gi
 runs a full `npm install` in the clone if one of those scripts is present, and OpenCode's installer
 fails with "git dep preparation failed". The TypeScript compile is `npm run compile`.
 
-Tested against OpenCode 2.0.22 and `@opencode/plugin` 2.0.22.
+Type checks target the installed `@opencode/plugin` 2.0.22 interfaces. The recoverable flow is tested
+through checkpoint/tool fixtures; these checks are not a live OpenCode session benchmark.
 
 The benchmark uses synthetic history and **simulated** Jev answers, without network/inference
 latency. It compares legacy pruning, cold/warm archives and checkpoint resume. It measures local

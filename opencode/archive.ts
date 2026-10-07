@@ -217,9 +217,19 @@ async function publish(path: string, text: string): Promise<boolean> {
 
 export class MemoryArchive {
   private readonly root: string;
+  private readonly sessions = new Map<string, { priorOff: Set<string>; examined: Set<string> }>();
 
   constructor(root: string) {
     this.root = resolve(root);
+  }
+
+  private tracking(sessionID: string): { priorOff: Set<string>; examined: Set<string> } {
+    let state = this.sessions.get(sessionID);
+    if (!state) {
+      state = { priorOff: new Set(), examined: new Set() };
+      this.sessions.set(sessionID, state);
+    }
+    return state;
   }
 
   private async directory(sessionID: string, create = false): Promise<string> {
@@ -250,12 +260,16 @@ export class MemoryArchive {
     });
     await syncDirectory(directory);
     await syncDirectory(this.root);
+    const state = this.tracking(sessionID);
+    for (const entry of entries) state.examined.add(entry.id);
     return entries;
   }
 
   async get(sessionID: string, id: string): Promise<ArchiveEntry> {
     validateID(id);
-    return this.getInDirectory(sessionID, await this.directory(sessionID), id);
+    const directory = await this.directory(sessionID);
+    this.tracking(sessionID).examined.add(id);
+    return this.getInDirectory(sessionID, directory, id);
   }
 
   private async getInDirectory(sessionID: string, directory: string, id: string): Promise<ArchiveEntry> {
@@ -267,9 +281,14 @@ export class MemoryArchive {
     return { ...input, id };
   }
 
-  private async verifyEntries(sessionID: string, directory: string, manifest: ArchiveManifest): Promise<void> {
+  private async verifyEntries(
+    sessionID: string,
+    directory: string,
+    manifest: ArchiveManifest,
+    verifyOff: (id: string) => boolean = () => true,
+  ): Promise<void> {
     await mapConcurrent(manifest.entries, async (entry) => {
-      if (entry.mode !== 'off') {
+      if (entry.mode !== 'off' || verifyOff(entry.id)) {
         await this.getInDirectory(sessionID, directory, entry.id);
       } else {
         const info = await lstat(join(directory, `${entry.id}.json`));
@@ -283,11 +302,16 @@ export class MemoryArchive {
     const text = serialize(manifest, true);
     const snapshot: ArchiveManifest = JSON.parse(text);
     const directory = await this.directory(sessionID, true);
-    await this.verifyEntries(sessionID, directory, snapshot);
+    const state = this.sessions.get(sessionID);
+    await this.verifyEntries(sessionID, directory, snapshot,
+      (id) => !state?.priorOff.has(id) || state.examined.has(id));
     const id = digest(sessionID, text);
     await publish(join(directory, `${id}.manifest.json`), text);
     await syncDirectory(directory);
     await syncDirectory(this.root);
+    const committed = this.tracking(sessionID);
+    committed.priorOff = new Set(snapshot.entries.filter((entry) => entry.mode === 'off').map((entry) => entry.id));
+    committed.examined.clear();
     return id;
   }
 
@@ -298,7 +322,8 @@ export class MemoryArchive {
     if (digest(sessionID, text) !== manifestID) throw new Error('Archive manifest content mismatch');
     const manifest: unknown = JSON.parse(text);
     validateManifest(manifest);
-    await this.verifyEntries(sessionID, directory, manifest);
+    await this.verifyEntries(sessionID, directory, manifest, () => false);
+    this.tracking(sessionID).priorOff = new Set(manifest.entries.filter((entry) => entry.mode === 'off').map((entry) => entry.id));
     return manifest;
   }
 
