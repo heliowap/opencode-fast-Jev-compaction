@@ -176,6 +176,10 @@ just the repo's `.claude-plugin/marketplace.json`.
 
 ## Development
 
+Development requires Node.js 22.12+ within the 22.x line, 24.x, or 26+;
+`devEngines` enforces this requirement with npm versions that support it.
+The published library retains Node.js 18+ runtime support.
+
 ```sh
 npm install
 npm run typecheck        # library + hook

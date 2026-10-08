@@ -242,7 +242,7 @@ The package has no `build` or `prepare` script on purpose. When it installs a gi
 runs a full `npm install` in the clone if one of those scripts is present, and OpenCode's installer
 fails with "git dep preparation failed". The TypeScript compile is `npm run compile`.
 
-Type checks target the installed `@opencode/plugin` 2.0.22 interfaces. The recoverable flow is tested
+Type checks target the installed `@opencode/plugin` interfaces. The recoverable flow is tested
 through checkpoint/tool fixtures; these checks are not a live OpenCode session benchmark.
 
 The benchmark uses synthetic history and **simulated** Jev answers, without network/inference
